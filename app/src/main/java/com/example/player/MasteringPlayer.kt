@@ -103,6 +103,21 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
         initTrack(buffer.sampleRate)
     }
 
+    /**
+     * Drops references to the current PCM track and native AudioTrack. This is
+     * used before decoding a replacement file so the old demo/song does not
+     * compete with the incoming decoded PCM for heap space.
+     */
+    fun unloadBuffer() {
+        stop()
+        currentBuffer = null
+        _durationSec.value = 0.0
+        loopStartSec = 0.0
+        loopEndSec = 0.0
+        audioTrack?.release()
+        audioTrack = null
+    }
+
     private fun initTrack(sampleRate: Int) {
         audioTrack?.release()
         val minBufferSize = AudioTrack.getMinBufferSize(
@@ -467,8 +482,6 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
     }
 
     fun release() {
-        stop()
-        audioTrack?.release()
-        audioTrack = null
+        unloadBuffer()
     }
 }

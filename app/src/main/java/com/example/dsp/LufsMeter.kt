@@ -14,7 +14,6 @@ data class LufsResult(
 
 object LufsMeter {
 
-    // Filter coefficients for Stage 1 (High-shelf pre-filter)
     private val STAGE1_48K = doubleArrayOf(
         1.53512485958697, -2.69169618940638, 1.19839281085285,
         1.0, -1.69065929318241, 0.73248077421585
@@ -24,7 +23,6 @@ object LufsMeter {
         1.0, -1.66367351134087, 0.71268558928114
     )
 
-    // Filter coefficients for Stage 2 (High-pass RLB weighting)
     private val STAGE2_48K = doubleArrayOf(
         1.0, -2.0, 1.0,
         1.0, -1.99004745483398, 0.99007225034111
@@ -59,16 +57,47 @@ object LufsMeter {
     }
 
     /**
-     * ITU-R BS.1770-style integrated loudness measurement for the sample rates
-     * supported by the current Android UI (44.1/48 kHz).
+     * Integrated loudness measurement using the existing validated 44.1/48 kHz
+     * K-weighting coefficient sets.
      *
-     * truePeakDb is a 4x cubic inter-sample estimate from TruePeakEstimator. It
-     * must not be presented as standards-certified dBTP.
+     * Inputs at other sample rates are first converted to 44.1 or 48 kHz so we
+     * never apply coefficients designed for one rate directly to another rate.
+     * truePeakDb remains a 4x cubic inter-sample estimate on the original signal
+     * and is not advertised as standards-certified dBTP.
      */
-    fun measure(buffer: AudioBuffer, targetLufs: Int = AudioConstants.TARGET_LUFS_DEFAULT): LufsResult {
-        val sampleRate = buffer.sampleRate
-        val is48k = sampleRate >= 46000
+    fun measure(
+        buffer: AudioBuffer,
+        targetLufs: Int = AudioConstants.TARGET_LUFS_DEFAULT
+    ): LufsResult {
+        var originalSamplePeak = 0.0
+        for (ch in 0 until buffer.channels) {
+            for (value in buffer.getChannel(ch)) {
+                originalSamplePeak = maxOf(originalSamplePeak, abs(value.toDouble()))
+            }
+        }
+        val samplePeakDb = if (originalSamplePeak > 1e-6) {
+            20.0 * log10(originalSamplePeak)
+        } else {
+            -96.0
+        }
+        val truePeakDb = TruePeakEstimator.dbPeak(buffer)
 
+        val measurementBuffer = when (buffer.sampleRate) {
+            AudioConstants.SAMPLE_RATE_44K,
+            AudioConstants.SAMPLE_RATE_48K -> buffer
+
+            else -> AudioResampler.resample(
+                buffer,
+                if (buffer.sampleRate >= 46_000) {
+                    AudioConstants.SAMPLE_RATE_48K
+                } else {
+                    AudioConstants.SAMPLE_RATE_44K
+                }
+            )
+        }
+
+        val sampleRate = measurementBuffer.sampleRate
+        val is48k = sampleRate == AudioConstants.SAMPLE_RATE_48K
         val s1Coeffs = if (is48k) STAGE1_48K else STAGE1_44K
         val s2Coeffs = if (is48k) STAGE2_48K else STAGE2_44K
 
@@ -77,17 +106,11 @@ object LufsMeter {
         val b2 = doubleArrayOf(s2Coeffs[0], s2Coeffs[1], s2Coeffs[2])
         val a2 = doubleArrayOf(s2Coeffs[3], s2Coeffs[4], s2Coeffs[5])
 
-        val numChannels = buffer.channels.coerceAtMost(2)
-        val filtered = Array(numChannels) { DoubleArray(buffer.length) }
-
-        var samplePeak = 0.0
+        val numChannels = measurementBuffer.channels.coerceAtMost(2)
+        val filtered = Array(numChannels) { DoubleArray(measurementBuffer.length) }
 
         for (ch in 0 until numChannels) {
-            val raw = buffer.getChannel(ch)
-            for (v in raw) {
-                val a = abs(v.toDouble())
-                if (a > samplePeak) samplePeak = a
-            }
+            val raw = measurementBuffer.getChannel(ch)
             val stage1 = applyIir(raw, b1, a1)
 
             var x1 = 0.0
@@ -114,10 +137,7 @@ object LufsMeter {
 
         val blockSize = (0.4 * sampleRate).roundToInt().coerceAtLeast(1)
         val hopSize = (0.1 * sampleRate).roundToInt().coerceAtLeast(1)
-        val numBlocks = (buffer.length - blockSize) / hopSize + 1
-
-        val samplePeakDb = if (samplePeak > 1e-6) 20.0 * log10(samplePeak) else -96.0
-        val truePeakDb = TruePeakEstimator.dbPeak(buffer)
+        val numBlocks = (measurementBuffer.length - blockSize) / hopSize + 1
 
         if (numBlocks <= 0) {
             return LufsResult(-96.0, samplePeakDb, truePeakDb, 1.0f)
@@ -126,30 +146,34 @@ object LufsMeter {
         val blockLoudness = DoubleArray(numBlocks)
         val blockMeanSquare = DoubleArray(numBlocks)
 
-        for (b in 0 until numBlocks) {
-            val start = b * hopSize
+        for (block in 0 until numBlocks) {
+            val start = block * hopSize
             var sumSquare = 0.0
 
             for (ch in 0 until numChannels) {
                 val data = filtered[ch]
-                var chSum = 0.0
+                var channelSum = 0.0
                 val end = (start + blockSize).coerceAtMost(data.size)
                 for (i in start until end) {
-                    val s = data[i]
-                    chSum += s * s
+                    val sample = data[i]
+                    channelSum += sample * sample
                 }
-                sumSquare += chSum / blockSize
+                sumSquare += channelSum / blockSize
             }
 
-            blockMeanSquare[b] = sumSquare
-            blockLoudness[b] = if (sumSquare > 1e-12) -0.691 + 10.0 * log10(sumSquare) else -96.0
+            blockMeanSquare[block] = sumSquare
+            blockLoudness[block] = if (sumSquare > 1e-12) {
+                -0.691 + 10.0 * log10(sumSquare)
+            } else {
+                -96.0
+            }
         }
 
         var absCount = 0
         var absSum = 0.0
-        for (b in 0 until numBlocks) {
-            if (blockLoudness[b] > AudioConstants.ABSOLUTE_THRESHOLD_LUFS) {
-                absSum += blockMeanSquare[b]
+        for (block in 0 until numBlocks) {
+            if (blockLoudness[block] > AudioConstants.ABSOLUTE_THRESHOLD_LUFS) {
+                absSum += blockMeanSquare[block]
                 absCount++
             }
         }
@@ -163,12 +187,12 @@ object LufsMeter {
 
         var relCount = 0
         var relSum = 0.0
-        for (b in 0 until numBlocks) {
+        for (block in 0 until numBlocks) {
             if (
-                blockLoudness[b] > AudioConstants.ABSOLUTE_THRESHOLD_LUFS &&
-                blockLoudness[b] > relThreshold
+                blockLoudness[block] > AudioConstants.ABSOLUTE_THRESHOLD_LUFS &&
+                blockLoudness[block] > relThreshold
             ) {
-                relSum += blockMeanSquare[b]
+                relSum += blockMeanSquare[block]
                 relCount++
             }
         }
@@ -179,13 +203,14 @@ object LufsMeter {
             absLoudness
         }
 
-        val normGain = calculateNormalizationGain(integratedLufs, targetLufs.toDouble())
-
         return LufsResult(
             integratedLufs = integratedLufs,
             samplePeakDb = samplePeakDb,
             truePeakDb = truePeakDb,
-            normalizationGain = normGain
+            normalizationGain = calculateNormalizationGain(
+                integratedLufs,
+                targetLufs.toDouble()
+            )
         )
     }
 

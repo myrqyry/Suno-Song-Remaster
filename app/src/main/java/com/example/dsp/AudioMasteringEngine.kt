@@ -6,9 +6,11 @@ import kotlin.math.pow
 object AudioMasteringEngine {
 
     /**
-     * Runs every stage that occurs before loudness normalization. Keeping this
-     * as one shared function lets the preview calculate its normalization gain
-     * from the same EQ/compression/stereo chain used by offline export.
+     * Runs every stage that occurs before loudness normalization.
+     *
+     * Only one full-track working copy is created. Tone, dynamics and stereo
+     * stages then mutate that copy in place so loading a normal-length song
+     * does not transiently allocate several complete PCM buffers at once.
      */
     fun processBeforeNormalization(
         inputBuffer: AudioBuffer,
@@ -23,112 +25,113 @@ object AudioMasteringEngine {
             val linearGain = 10.0.pow(settings.inputGain.toDouble() / 20.0).toFloat()
             for (c in 0 until current.channels) {
                 val data = current.getChannel(c)
-                for (i in data.indices) data[i] *= linearGain
+                for (i in 0 until current.length) data[i] *= linearGain
             }
         }
         onProgress?.invoke(0.15f)
 
         // 2. Clean Low End (30 Hz high-pass)
         if (settings.cleanLowEnd) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.HIGHPASS,
                 AudioConstants.HIGHPASS_FREQ,
                 sr,
                 q = 0.707
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         onProgress?.invoke(0.3f)
 
         // 3. 5-band EQ
         if (settings.eqLow != 0.0f) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.LOWSHELF,
                 AudioConstants.FREQ_LOW,
                 sr,
                 gainDb = settings.eqLow.toDouble()
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         if (settings.eqLowMid != 0.0f) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.PEAKING,
                 AudioConstants.FREQ_LOW_MID,
                 sr,
                 q = 1.0,
                 gainDb = settings.eqLowMid.toDouble()
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         if (settings.eqMid != 0.0f) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.PEAKING,
                 AudioConstants.FREQ_MID,
                 sr,
                 q = 1.0,
                 gainDb = settings.eqMid.toDouble()
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         if (settings.eqHighMid != 0.0f) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.PEAKING,
                 AudioConstants.FREQ_HIGH_MID,
                 sr,
                 q = 1.0,
                 gainDb = settings.eqHighMid.toDouble()
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         if (settings.eqHigh != 0.0f) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.HIGHSHELF,
                 AudioConstants.FREQ_HIGH,
                 sr,
                 gainDb = settings.eqHigh.toDouble()
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         onProgress?.invoke(0.5f)
 
         // 4. Character filters
         if (settings.cutMud) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.PEAKING,
                 AudioConstants.MUD_CUT_FREQ,
                 sr,
                 q = 1.5,
                 gainDb = -3.0
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         if (settings.addAir) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.HIGHSHELF,
                 AudioConstants.AIR_FREQ,
                 sr,
                 gainDb = 2.5
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         if (settings.tameHarsh) {
-            current = BiquadFilter(
+            BiquadFilter(
                 BiquadType.PEAKING,
                 AudioConstants.HARSHNESS_FREQ_1,
                 sr,
                 q = AudioConstants.HARSHNESS_Q_4K,
                 gainDb = AudioConstants.HARSHNESS_GAIN_4K
-            ).processBuffer(current)
-            current = BiquadFilter(
+            ).processBufferInPlace(current)
+            BiquadFilter(
                 BiquadType.PEAKING,
                 AudioConstants.HARSHNESS_FREQ_2,
                 sr,
                 q = AudioConstants.HARSHNESS_Q_6K,
                 gainDb = AudioConstants.HARSHNESS_GAIN_6K
-            ).processBuffer(current)
+            ).processBufferInPlace(current)
         }
         onProgress?.invoke(0.65f)
 
         // 5. Glue compressor
         if (settings.glueCompression) {
-            current = DynamicsProcessor(current.sampleRate).processGlueCompression(current)
+            DynamicsProcessor(current.sampleRate).processGlueCompressionInPlace(current)
         }
         onProgress?.invoke(0.8f)
 
-        // 6. Mid/side stereo processing & center bass
-        current = StereoProcessor(current.sampleRate).process(
+        // 6. Mid/side stereo processing & center bass. Stereo input is mutated
+        // in place; mono input necessarily expands to a new stereo buffer.
+        current = StereoProcessor(current.sampleRate).processInPlace(
             current,
             settings.stereoWidth,
             settings.centerBass
@@ -162,7 +165,7 @@ object AudioMasteringEngine {
                 .normalizationGain
             for (c in 0 until current.channels) {
                 val data = current.getChannel(c)
-                for (i in data.indices) data[i] *= normGain
+                for (i in 0 until current.length) data[i] *= normGain
             }
         }
         onProgress?.invoke(0.82f)

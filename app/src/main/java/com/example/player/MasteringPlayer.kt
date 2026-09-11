@@ -7,7 +7,8 @@ import com.example.dsp.AudioBuffer
 import com.example.dsp.AudioConstants
 import com.example.dsp.BiquadFilter
 import com.example.dsp.BiquadType
-import com.example.dsp.StereoProcessor
+import com.example.dsp.SpectrumAnalyzer
+import com.example.dsp.StreamingGlueCompressor
 import com.example.model.MasteringSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,11 +19,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.cos
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 data class MeterData(
@@ -37,12 +36,23 @@ data class MeterData(
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is MeterData) return false
-        return leftDb == other.leftDb && rightDb == other.rightDb
+        return leftDb == other.leftDb &&
+            rightDb == other.rightDb &&
+            leftPeakDb == other.leftPeakDb &&
+            rightPeakDb == other.rightPeakDb &&
+            leftClip == other.leftClip &&
+            rightClip == other.rightClip &&
+            spectrumBands.contentEquals(other.spectrumBands)
     }
 
     override fun hashCode(): Int {
         var result = leftDb.hashCode()
         result = 31 * result + rightDb.hashCode()
+        result = 31 * result + leftPeakDb.hashCode()
+        result = 31 * result + rightPeakDb.hashCode()
+        result = 31 * result + leftClip.hashCode()
+        result = 31 * result + rightClip.hashCode()
+        result = 31 * result + spectrumBands.contentHashCode()
         return result
     }
 }
@@ -73,7 +83,6 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
     var settings: MasteringSettings = MasteringSettings()
     var normGain: Float = 1.0f
 
-    // Loop points in seconds
     var loopEnabled: Boolean = false
     var loopStartSec: Double = 0.0
     var loopEndSec: Double = 0.0
@@ -81,7 +90,6 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
     @Volatile
     private var currentSamplePosition = 0
 
-    // Peak holds
     private var leftPeakHold = -60f
     private var rightPeakHold = -60f
     private var lastPeakDecayTime = System.currentTimeMillis()
@@ -139,7 +147,6 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
         }
 
         _isPlaying.value = true
-
         playbackJob = coroutineScope.launch(Dispatchers.Default) {
             runPlaybackLoop()
         }
@@ -151,7 +158,8 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
         try {
             audioTrack?.pause()
             audioTrack?.flush()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         _meterData.value = MeterData()
     }
 
@@ -161,7 +169,8 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
         try {
             audioTrack?.stop()
             audioTrack?.flush()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         currentSamplePosition = 0
         _currentPositionSec.value = 0.0
         _meterData.value = MeterData()
@@ -170,7 +179,9 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
     fun seekTo(seconds: Double) {
         val buffer = currentBuffer ?: return
         val clampedSec = seconds.coerceIn(0.0, buffer.durationSeconds)
-        currentSamplePosition = (clampedSec * buffer.sampleRate).toInt().coerceIn(0, buffer.length)
+        currentSamplePosition = (clampedSec * buffer.sampleRate)
+            .toInt()
+            .coerceIn(0, buffer.length)
         _currentPositionSec.value = clampedSec
     }
 
@@ -188,26 +199,75 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
         val chunkSize = 1024
         val shortBuffer = ShortArray(chunkSize * 2)
 
-        // Local filters for streaming
         val srD = sampleRate.toDouble()
-        val hpFilter = BiquadFilter(BiquadType.HIGHPASS, AudioConstants.HIGHPASS_FREQ, srD, q = 0.707)
+        val hpFilter = BiquadFilter(
+            BiquadType.HIGHPASS,
+            AudioConstants.HIGHPASS_FREQ,
+            srD,
+            q = 0.707
+        )
         val eqLowFilter = BiquadFilter(BiquadType.LOWSHELF, AudioConstants.FREQ_LOW, srD)
-        val eqLowMidFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.FREQ_LOW_MID, srD, q = 1.0)
-        val eqMidFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.FREQ_MID, srD, q = 1.0)
-        val eqHighMidFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.FREQ_HIGH_MID, srD, q = 1.0)
+        val eqLowMidFilter = BiquadFilter(
+            BiquadType.PEAKING,
+            AudioConstants.FREQ_LOW_MID,
+            srD,
+            q = 1.0
+        )
+        val eqMidFilter = BiquadFilter(
+            BiquadType.PEAKING,
+            AudioConstants.FREQ_MID,
+            srD,
+            q = 1.0
+        )
+        val eqHighMidFilter = BiquadFilter(
+            BiquadType.PEAKING,
+            AudioConstants.FREQ_HIGH_MID,
+            srD,
+            q = 1.0
+        )
         val eqHighFilter = BiquadFilter(BiquadType.HIGHSHELF, AudioConstants.FREQ_HIGH, srD)
-        val mudFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.MUD_CUT_FREQ, srD, q = 1.5, gainDb = -3.0)
-        val airFilter = BiquadFilter(BiquadType.HIGHSHELF, AudioConstants.AIR_FREQ, srD, gainDb = 2.5)
-        val harsh1 = BiquadFilter(BiquadType.PEAKING, AudioConstants.HARSHNESS_FREQ_1, srD, q = AudioConstants.HARSHNESS_Q_4K, gainDb = AudioConstants.HARSHNESS_GAIN_4K)
-        val harsh2 = BiquadFilter(BiquadType.PEAKING, AudioConstants.HARSHNESS_FREQ_2, srD, q = AudioConstants.HARSHNESS_Q_6K, gainDb = AudioConstants.HARSHNESS_GAIN_6K)
-        val sideHp = BiquadFilter(BiquadType.HIGHPASS, AudioConstants.BASS_MONO_FREQ, srD, q = 0.707)
+        val mudFilter = BiquadFilter(
+            BiquadType.PEAKING,
+            AudioConstants.MUD_CUT_FREQ,
+            srD,
+            q = 1.5,
+            gainDb = -3.0
+        )
+        val airFilter = BiquadFilter(
+            BiquadType.HIGHSHELF,
+            AudioConstants.AIR_FREQ,
+            srD,
+            gainDb = 2.5
+        )
+        val harsh1 = BiquadFilter(
+            BiquadType.PEAKING,
+            AudioConstants.HARSHNESS_FREQ_1,
+            srD,
+            q = AudioConstants.HARSHNESS_Q_4K,
+            gainDb = AudioConstants.HARSHNESS_GAIN_4K
+        )
+        val harsh2 = BiquadFilter(
+            BiquadType.PEAKING,
+            AudioConstants.HARSHNESS_FREQ_2,
+            srD,
+            q = AudioConstants.HARSHNESS_Q_6K,
+            gainDb = AudioConstants.HARSHNESS_GAIN_6K
+        )
+        val sideHp = BiquadFilter(
+            BiquadType.HIGHPASS,
+            AudioConstants.BASS_MONO_FREQ,
+            srD,
+            q = 0.707
+        )
+        val glueCompressor = StreamingGlueCompressor(sampleRate)
 
         while (coroutineScope.isActive && _isPlaying.value) {
             val totalFrames = buffer.length
             if (currentSamplePosition >= totalFrames) {
                 if (loopEnabled) {
-                    val loopStartSample = (loopStartSec * sampleRate).toInt().coerceIn(0, totalFrames)
-                    currentSamplePosition = loopStartSample
+                    currentSamplePosition = (loopStartSec * sampleRate)
+                        .toInt()
+                        .coerceIn(0, totalFrames)
                 } else {
                     stop()
                     break
@@ -217,7 +277,9 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
             if (loopEnabled && loopEndSec > loopStartSec) {
                 val endSample = (loopEndSec * sampleRate).toInt()
                 if (currentSamplePosition >= endSample) {
-                    currentSamplePosition = (loopStartSec * sampleRate).toInt().coerceIn(0, totalFrames)
+                    currentSamplePosition = (loopStartSec * sampleRate)
+                        .toInt()
+                        .coerceIn(0, totalFrames)
                 }
             }
 
@@ -227,15 +289,18 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
             val currentSettings = settings
             val bypass = _isBypass.value
 
-            // Update real-time filter params
             eqLowFilter.update(gainDb = currentSettings.eqLow.toDouble())
             eqLowMidFilter.update(gainDb = currentSettings.eqLowMid.toDouble())
             eqMidFilter.update(gainDb = currentSettings.eqMid.toDouble())
             eqHighMidFilter.update(gainDb = currentSettings.eqHighMid.toDouble())
             eqHighFilter.update(gainDb = currentSettings.eqHigh.toDouble())
 
-            val linearInputGain = 10.0.pow(currentSettings.inputGain.toDouble() / 20.0).toFloat()
-            val ceilingLinear = 10.0.pow(currentSettings.truePeakCeiling.toDouble() / 20.0).toFloat()
+            val linearInputGain = 10.0
+                .pow(currentSettings.inputGain.toDouble() / 20.0)
+                .toFloat()
+            val ceilingLinear = 10.0
+                .pow(currentSettings.truePeakCeiling.toDouble() / 20.0)
+                .toFloat()
             val stereoWidthFactor = currentSettings.stereoWidth / 100f
 
             val leftChannel = buffer.getChannel(0)
@@ -245,120 +310,138 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
             var sumSqR = 0.0
             var peakL = 0f
             var peakR = 0f
-
-            val spectrumBins = FloatArray(16)
+            val spectrumInput = FloatArray(framesToRead)
 
             for (i in 0 until framesToRead) {
                 val sampleIdx = currentSamplePosition + i
-                var l = leftChannel[sampleIdx]
-                var r = rightChannel[sampleIdx]
+                var left = leftChannel[sampleIdx]
+                var right = rightChannel[sampleIdx]
 
                 if (!bypass) {
                     // 1. Input gain
-                    l *= linearInputGain
-                    r *= linearInputGain
+                    left *= linearInputGain
+                    right *= linearInputGain
 
                     // 2. Highpass
                     if (currentSettings.cleanLowEnd) {
-                        l = hpFilter.processSample(l, 0)
-                        r = hpFilter.processSample(r, 1)
+                        left = hpFilter.processSample(left, 0)
+                        right = hpFilter.processSample(right, 1)
                     }
 
                     // 3. EQ
                     if (currentSettings.eqLow != 0f) {
-                        l = eqLowFilter.processSample(l, 0)
-                        r = eqLowFilter.processSample(r, 1)
+                        left = eqLowFilter.processSample(left, 0)
+                        right = eqLowFilter.processSample(right, 1)
                     }
                     if (currentSettings.eqLowMid != 0f) {
-                        l = eqLowMidFilter.processSample(l, 0)
-                        r = eqLowMidFilter.processSample(r, 1)
+                        left = eqLowMidFilter.processSample(left, 0)
+                        right = eqLowMidFilter.processSample(right, 1)
                     }
                     if (currentSettings.eqMid != 0f) {
-                        l = eqMidFilter.processSample(l, 0)
-                        r = eqMidFilter.processSample(r, 1)
+                        left = eqMidFilter.processSample(left, 0)
+                        right = eqMidFilter.processSample(right, 1)
                     }
                     if (currentSettings.eqHighMid != 0f) {
-                        l = eqHighMidFilter.processSample(l, 0)
-                        r = eqHighMidFilter.processSample(r, 1)
+                        left = eqHighMidFilter.processSample(left, 0)
+                        right = eqHighMidFilter.processSample(right, 1)
                     }
                     if (currentSettings.eqHigh != 0f) {
-                        l = eqHighFilter.processSample(l, 0)
-                        r = eqHighFilter.processSample(r, 1)
+                        left = eqHighFilter.processSample(left, 0)
+                        right = eqHighFilter.processSample(right, 1)
                     }
 
-                    // 4. Character Filters
+                    // 4. Character filters
                     if (currentSettings.cutMud) {
-                        l = mudFilter.processSample(l, 0)
-                        r = mudFilter.processSample(r, 1)
+                        left = mudFilter.processSample(left, 0)
+                        right = mudFilter.processSample(right, 1)
                     }
                     if (currentSettings.addAir) {
-                        l = airFilter.processSample(l, 0)
-                        r = airFilter.processSample(r, 1)
+                        left = airFilter.processSample(left, 0)
+                        right = airFilter.processSample(right, 1)
                     }
                     if (currentSettings.tameHarsh) {
-                        l = harsh1.processSample(l, 0)
-                        r = harsh1.processSample(r, 1)
-                        l = harsh2.processSample(l, 0)
-                        r = harsh2.processSample(r, 1)
+                        left = harsh1.processSample(left, 0)
+                        right = harsh1.processSample(right, 1)
+                        left = harsh2.processSample(left, 0)
+                        right = harsh2.processSample(right, 1)
                     }
 
-                    // 5. Mid/Side & Center Bass
-                    val mid = (l + r) * 0.5f
-                    var side = (l - r) * 0.5f
+                    // 5. Glue compressor. This was previously missing in preview.
+                    if (currentSettings.glueCompression) {
+                        val gain = glueCompressor.gainFor(left, right)
+                        left *= gain
+                        right *= gain
+                    }
+
+                    // 6. Mid/Side & Center Bass
+                    val mid = (left + right) * 0.5f
+                    var side = (left - right) * 0.5f
                     if (currentSettings.centerBass) {
                         side = sideHp.processSample(side, 0)
                     }
                     side *= stereoWidthFactor
-                    l = mid + side
-                    r = mid - side
+                    left = mid + side
+                    right = mid - side
 
-                    // 6. Normalization
+                    // 7. Loudness normalization gain is computed from the same
+                    // pre-normalization mastering chain by the ViewModel.
                     if (currentSettings.normalizeLoudness) {
-                        l *= normGain
-                        r *= normGain
+                        left *= normGain
+                        right *= normGain
                     }
 
-                    // 7. Ceiling
+                    // 8. Realtime preview uses a sample ceiling. Offline export
+                    // performs the additional 4x inter-sample safety pass.
                     if (currentSettings.truePeakLimit) {
-                        l = l.coerceIn(-ceilingLinear, ceilingLinear)
-                        r = r.coerceIn(-ceilingLinear, ceilingLinear)
+                        left = left.coerceIn(-ceilingLinear, ceilingLinear)
+                        right = right.coerceIn(-ceilingLinear, ceilingLinear)
                     }
                 }
 
-                // Level meter metrics
-                val absL = abs(l)
-                val absR = abs(r)
+                val absL = abs(left)
+                val absR = abs(right)
                 sumSqL += absL * absL
                 sumSqR += absR * absR
                 if (absL > peakL) peakL = absL
                 if (absR > peakR) peakR = absR
+                spectrumInput[i] = (left + right) * 0.5f
 
-                // Spectrum bin distribution estimation
-                val binIdx = (i % 16)
-                spectrumBins[binIdx] += (absL + absR) * 0.5f
-
-                // Convert to 16-bit PCM
-                val shortL = (l.coerceIn(-1.0f, 1.0f) * 32767f).toInt().toShort()
-                val shortR = (r.coerceIn(-1.0f, 1.0f) * 32767f).toInt().toShort()
-                shortBuffer[i * 2] = shortL
-                shortBuffer[i * 2 + 1] = shortR
+                shortBuffer[i * 2] = (left.coerceIn(-1.0f, 1.0f) * 32767f)
+                    .toInt()
+                    .toShort()
+                shortBuffer[i * 2 + 1] = (right.coerceIn(-1.0f, 1.0f) * 32767f)
+                    .toInt()
+                    .toShort()
             }
 
-            // Write to AudioTrack
             audioTrack?.write(shortBuffer, 0, framesToRead * 2)
 
             currentSamplePosition += framesToRead
             _currentPositionSec.value = currentSamplePosition.toDouble() / sampleRate
 
-            // Calculate RMS dBFS
             val rmsL = sqrt(sumSqL / framesToRead).toFloat()
             val rmsR = sqrt(sumSqR / framesToRead).toFloat()
-            val dbL = if (rmsL > 1e-4f) (20f * log10(rmsL)).coerceIn(-60f, 3f) else -60f
-            val dbR = if (rmsR > 1e-4f) (20f * log10(rmsR)).coerceIn(-60f, 3f) else -60f
-            val peakDbL = if (peakL > 1e-4f) (20f * log10(peakL)).coerceIn(-60f, 3f) else -60f
-            val peakDbR = if (peakR > 1e-4f) (20f * log10(peakR)).coerceIn(-60f, 3f) else -60f
+            val dbL = if (rmsL > 1e-4f) {
+                (20f * log10(rmsL)).coerceIn(-60f, 3f)
+            } else {
+                -60f
+            }
+            val dbR = if (rmsR > 1e-4f) {
+                (20f * log10(rmsR)).coerceIn(-60f, 3f)
+            } else {
+                -60f
+            }
+            val peakDbL = if (peakL > 1e-4f) {
+                (20f * log10(peakL)).coerceIn(-60f, 3f)
+            } else {
+                -60f
+            }
+            val peakDbR = if (peakR > 1e-4f) {
+                (20f * log10(peakR)).coerceIn(-60f, 3f)
+            } else {
+                -60f
+            }
 
-            // Peak hold decay
             val now = System.currentTimeMillis()
             if (now - lastPeakDecayTime > 80) {
                 leftPeakHold = max(peakDbL, leftPeakHold - 1.5f)
@@ -369,11 +452,6 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
                 rightPeakHold = max(peakDbR, rightPeakHold)
             }
 
-            // Normalize spectrum bins
-            val normSpectrum = FloatArray(16) { idx ->
-                (spectrumBins[idx] / (framesToRead / 16f) * 2.5f).coerceIn(0f, 1f)
-            }
-
             _meterData.value = MeterData(
                 leftDb = dbL,
                 rightDb = dbR,
@@ -381,7 +459,7 @@ class MasteringPlayer(private val coroutineScope: CoroutineScope) {
                 rightPeakDb = rightPeakHold,
                 leftClip = peakL >= 0.999f,
                 rightClip = peakR >= 0.999f,
-                spectrumBands = normSpectrum
+                spectrumBands = SpectrumAnalyzer.analyzeMono(spectrumInput, sampleRate)
             )
         }
 

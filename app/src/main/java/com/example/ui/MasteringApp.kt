@@ -1,26 +1,20 @@
 package com.example.ui
 
+import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Audiotrack
@@ -29,7 +23,6 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -58,7 +51,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -68,7 +60,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.model.BatchItem
 import com.example.ui.components.LevelMeter
 import com.example.ui.components.SpectrumVisualizer
 import com.example.ui.components.TransportControls
@@ -79,11 +70,8 @@ import com.example.ui.screens.WaveformEditorScreen
 import com.example.ui.theme.StudioCyan
 import com.example.ui.theme.StudioGreen
 import com.example.ui.theme.StudioPurple
-import com.example.ui.theme.StudioRed
 import com.example.viewmodel.MasteringViewModel
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
 import java.util.Locale
 
 enum class AppNavTab(val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
@@ -105,7 +93,6 @@ fun MasteringApp(
     var selectedTab by remember { mutableStateOf(AppNavTab.MASTERING) }
     var showDemoMenu by remember { mutableStateOf(false) }
 
-    // Collect VM state
     val activeBuffer by viewModel.activeBuffer.collectAsState()
     val currentFileName by viewModel.currentFileName.collectAsState()
     val settings by viewModel.settings.collectAsState()
@@ -119,27 +106,23 @@ fun MasteringApp(
     val statusMsg by viewModel.statusMessage.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
 
-    // Editor states
     val selStart by viewModel.selectionStart.collectAsState()
     val selEnd by viewModel.selectionEnd.collectAsState()
     val canUndo by viewModel.canUndo.collectAsState()
     val fadeDuration by viewModel.fadeDuration.collectAsState()
     val loopEnabled by viewModel.loopEnabled.collectAsState()
 
-    // Batch states
     val batchQueue by viewModel.batchQueue.collectAsState()
     val isBatchProcessing by viewModel.isBatchProcessing.collectAsState()
     val batchProgress by viewModel.batchProgress.collectAsState()
     val batchStatusText by viewModel.batchStatusText.collectAsState()
 
-    // Status snackbar observer
     LaunchedEffect(statusMsg) {
         statusMsg?.let { msg ->
             snackbarHostState.showSnackbar(msg.text)
         }
     }
 
-    // Audio file picker (for active track or batch)
     var isAddingToBatch by remember { mutableStateOf(false) }
     val openAudioLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -160,7 +143,6 @@ fun MasteringApp(
         }
     }
 
-    // Save/Export Mastered WAV launcher
     val exportFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("audio/wav")
     ) { uri: Uri? ->
@@ -171,14 +153,55 @@ fun MasteringApp(
         }
     }
 
+    // Batch export uses Storage Access Framework instead of writing into the
+    // app-private Android/data directory. The user chooses a real destination
+    // folder and every mastered WAV is created there.
+    val batchFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri: Uri? ->
+        if (treeUri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Some providers grant session access without persistable flags.
+            }
+
+            viewModel.runBatchProcessing(context) { item ->
+                val fileName = "${item.name.substringBeforeLast(".")}_mastered.wav"
+                val documentUri = DocumentsContract.createDocument(
+                    context.contentResolver,
+                    treeUri,
+                    "audio/wav",
+                    fileName
+                )
+                documentUri?.let { context.contentResolver.openOutputStream(it) }
+            }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Icon(imageVector = Icons.Default.Audiotrack, contentDescription = null, tint = StudioPurple, modifier = Modifier.size(20.dp))
-                            Text("AI Music Remastering", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Audiotrack,
+                                contentDescription = null,
+                                tint = StudioPurple,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                "Suno Song Remaster",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                         Text(
                             text = currentFileName,
@@ -190,20 +213,23 @@ fun MasteringApp(
                     }
                 },
                 actions = {
-                    // Demo Track Selector Button
                     Box {
                         IconButton(
                             onClick = { showDemoMenu = true },
                             modifier = Modifier.testTag("demo_menu_button")
                         ) {
-                            Icon(imageVector = Icons.Default.MusicNote, contentDescription = "Demo Tracks", tint = StudioCyan)
+                            Icon(
+                                imageVector = Icons.Default.MusicNote,
+                                contentDescription = "Demo Tracks",
+                                tint = StudioCyan
+                            )
                         }
                         DropdownMenu(
                             expanded = showDemoMenu,
                             onDismissRequest = { showDemoMenu = false }
                         ) {
                             DropdownMenuItem(
-                                text = { Text("AI Synthwave Anthem (Demo)") },
+                                text = { Text("Synthwave Anthem (Demo)") },
                                 onClick = {
                                     showDemoMenu = false
                                     viewModel.loadDemoTrack("synthwave")
@@ -226,7 +252,6 @@ fun MasteringApp(
                         }
                     }
 
-                    // Open Audio File Button
                     IconButton(
                         onClick = {
                             isAddingToBatch = false
@@ -234,10 +259,12 @@ fun MasteringApp(
                         },
                         modifier = Modifier.testTag("open_file_button")
                     ) {
-                        Icon(imageVector = Icons.Default.MoreVert, contentDescription = "Open Audio File")
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "Open Audio File"
+                        )
                     }
 
-                    // Export Mastered WAV Button
                     IconButton(
                         onClick = {
                             val baseName = currentFileName.substringBeforeLast(".")
@@ -245,7 +272,11 @@ fun MasteringApp(
                         },
                         modifier = Modifier.testTag("export_wav_button")
                     ) {
-                        Icon(imageVector = Icons.Default.Download, contentDescription = "Export WAV", tint = StudioGreen)
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = "Export WAV",
+                            tint = StudioGreen
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -264,7 +295,13 @@ fun MasteringApp(
                         selected = isSelected,
                         onClick = { selectedTab = tab },
                         icon = { Icon(imageVector = tab.icon, contentDescription = tab.title) },
-                        label = { Text(tab.title, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
+                        label = {
+                            Text(
+                                tab.title,
+                                fontSize = 11.sp,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        },
                         colors = NavigationBarItemDefaults.colors(
                             selectedIconColor = Color.White,
                             selectedTextColor = StudioPurple,
@@ -283,7 +320,6 @@ fun MasteringApp(
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background)
         ) {
-            // ─── Header Meters & LUFS Info Bar ─────────────────────────────────
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -291,7 +327,6 @@ fun MasteringApp(
                 color = Color.Transparent
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    // LUFS & Peak Badge
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -299,9 +334,14 @@ fun MasteringApp(
                     ) {
                         val measuredLufs = lufsResult?.integratedLufs
                         val lufsText = if (measuredLufs != null && measuredLufs > -70f) {
-                            String.format(Locale.US, "Measured: %.1f LUFS  |  Target: %d LUFS", measuredLufs, settings.targetLufs)
+                            String.format(
+                                Locale.US,
+                                "Measured: %.1f LUFS  |  Target: %d LUFS",
+                                measuredLufs,
+                                settings.targetLufs
+                            )
                         } else {
-                            "Target: ${settings.targetLufs} LUFS  |  BS.1770-4 Active"
+                            "Target: ${settings.targetLufs} LUFS  |  Loudness meter active"
                         }
                         Text(
                             text = lufsText,
@@ -312,14 +352,20 @@ fun MasteringApp(
                         )
 
                         if (isLoading) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = StudioPurple)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(14.dp),
+                                    strokeWidth = 2.dp,
+                                    color = StudioPurple
+                                )
                                 Text("Processing...", fontSize = 10.sp, color = StudioPurple)
                             }
                         }
                     }
 
-                    // Stereo Level Meter & Spectrum
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -334,7 +380,6 @@ fun MasteringApp(
                         )
                     }
 
-                    // Transport Bar (Play/Pause, Stop, Seek, Bypass)
                     TransportControls(
                         isPlaying = isPlaying,
                         currentSec = currentSec,
@@ -350,7 +395,6 @@ fun MasteringApp(
                 }
             }
 
-            // ─── Main Content Tabs ─────────────────────────────────────────────
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -364,6 +408,7 @@ fun MasteringApp(
                             onPresetSelected = { viewModel.setPreset(it) }
                         )
                     }
+
                     AppNavTab.EDITOR -> {
                         WaveformEditorScreen(
                             buffer = activeBuffer,
@@ -376,7 +421,7 @@ fun MasteringApp(
                             isPlaying = isPlaying,
                             canUndo = canUndo,
                             onSeek = { viewModel.player.seekTo(it) },
-                            onSelectRange = { s, e -> viewModel.setSelection(s, e) },
+                            onSelectRange = { start, end -> viewModel.setSelection(start, end) },
                             onClearSelection = { viewModel.clearSelection() },
                             onPlayPause = {
                                 if (isPlaying) viewModel.player.pause() else viewModel.player.play()
@@ -394,6 +439,7 @@ fun MasteringApp(
                             onReset = { viewModel.resetToOriginal() }
                         )
                     }
+
                     AppNavTab.METADATA -> {
                         MetadataEditorScreen(
                             metadata = metadata,
@@ -402,6 +448,7 @@ fun MasteringApp(
                             onApplyToAll = { viewModel.applyMetadataToAllBatch() }
                         )
                     }
+
                     AppNavTab.BATCH -> {
                         BatchQueueScreen(
                             queue = batchQueue,
@@ -422,14 +469,7 @@ fun MasteringApp(
                             },
                             onRemoveItem = { viewModel.removeBatchItem(it) },
                             onClearQueue = { viewModel.clearBatch() },
-                            onStartBatch = {
-                                viewModel.runBatchProcessing(context) { item ->
-                                    val outDir = File(context.getExternalFilesDir(null), "MasteredAudio")
-                                    if (!outDir.exists()) outDir.mkdirs()
-                                    val outFile = File(outDir, "${item.name.substringBeforeLast(".")}_mastered.wav")
-                                    FileOutputStream(outFile)
-                                }
-                            }
+                            onStartBatch = { batchFolderLauncher.launch(null) }
                         )
                     }
                 }

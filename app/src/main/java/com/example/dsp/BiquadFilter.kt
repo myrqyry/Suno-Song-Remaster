@@ -147,18 +147,26 @@ class BiquadFilter(
     }
 
     fun processBuffer(buffer: AudioBuffer): AudioBuffer {
-        val out = AudioBuffer(buffer.channels, buffer.length, buffer.sampleRate)
+        val out = buffer.copy()
+        processBufferInPlace(out)
+        return out
+    }
+
+    /**
+     * Applies the filter without allocating a second full-track AudioBuffer.
+     * Each channel uses local state so offline processing remains deterministic
+     * and independent of any prior processSample() calls on this filter object.
+     */
+    fun processBufferInPlace(buffer: AudioBuffer) {
         for (c in 0 until buffer.channels) {
-            val src = buffer.getChannel(c)
-            val dst = out.getChannel(c)
-            val channelIdx = c.coerceIn(0, 1)
+            val data = buffer.getChannel(c)
             var stateX1 = 0.0
             var stateX2 = 0.0
             var stateY1 = 0.0
             var stateY2 = 0.0
 
             for (i in 0 until buffer.length) {
-                val x0 = src[i].toDouble()
+                val x0 = data[i].toDouble()
                 val y0 = b0 * x0 + b1 * stateX1 + b2 * stateX2 - a1 * stateY1 - a2 * stateY2
 
                 stateX2 = stateX1
@@ -166,9 +174,8 @@ class BiquadFilter(
                 stateY2 = stateY1
                 stateY1 = y0
 
-                dst[i] = y0.toFloat()
+                data[i] = y0.toFloat()
             }
         }
-        return out
     }
 }

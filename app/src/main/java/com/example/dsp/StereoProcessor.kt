@@ -13,30 +13,46 @@ class StereoProcessor(private val sampleRate: Int) {
         stereoWidthPercent: Int,
         centerBass: Boolean
     ): AudioBuffer {
+        val working = input.copy()
+        return processInPlace(working, stereoWidthPercent, centerBass)
+    }
+
+    /**
+     * Mutates stereo input directly. Mono input necessarily expands to a new
+     * stereo buffer because AudioBuffer channel count is fixed at construction.
+     */
+    fun processInPlace(
+        input: AudioBuffer,
+        stereoWidthPercent: Int,
+        centerBass: Boolean
+    ): AudioBuffer {
         val width = (stereoWidthPercent / 100f).coerceIn(0f, 2f)
-
-        // If mono, expand to stereo
-        val leftSrc: FloatArray
-        val rightSrc: FloatArray
-        if (input.channels == 1) {
-            leftSrc = input.getChannel(0)
-            rightSrc = input.getChannel(0)
-        } else {
-            leftSrc = input.getChannel(0)
-            rightSrc = input.getChannel(1)
-        }
-
-        val out = AudioBuffer(2, input.length, input.sampleRate)
-        val outL = out.getChannel(0)
-        val outR = out.getChannel(1)
 
         sideHighpass.update(sampleRate = input.sampleRate.toDouble())
         sideHighpass.reset()
 
-        for (i in 0 until input.length) {
-            val l = leftSrc[i]
-            val r = rightSrc[i]
+        if (input.channels == 1) {
+            val source = input.getChannel(0)
+            val out = AudioBuffer(2, input.length, input.sampleRate)
+            val outL = out.getChannel(0)
+            val outR = out.getChannel(1)
 
+            for (i in 0 until input.length) {
+                val mid = source[i]
+                // Mono has no side content. Width/center-bass therefore leave
+                // both expanded channels identical.
+                outL[i] = mid
+                outR[i] = mid
+            }
+            return out
+        }
+
+        val left = input.getChannel(0)
+        val right = input.getChannel(1)
+
+        for (i in 0 until input.length) {
+            val l = left[i]
+            val r = right[i]
             val mid = (l + r) * 0.5f
             var side = (l - r) * 0.5f
 
@@ -45,11 +61,10 @@ class StereoProcessor(private val sampleRate: Int) {
             }
 
             side *= width
-
-            outL[i] = mid + side
-            outR[i] = mid - side
+            left[i] = mid + side
+            right[i] = mid - side
         }
 
-        return out
+        return input
     }
 }

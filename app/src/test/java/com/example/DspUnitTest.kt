@@ -19,7 +19,6 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sin
 
@@ -112,11 +111,14 @@ class DspUnitTest {
         for (i in data.indices) data[i] = pattern[i % pattern.size]
 
         val ceilingDb = -1.0f
-        val ceilingLinear = 10.0.pow(ceilingDb / 20.0)
+        val ceilingLinear = 10.0.pow(ceilingDb.toDouble() / 20.0)
         val limited = DynamicsProcessor(44100).processLimiter(buffer, ceilingDb)
         val measured = TruePeakEstimator.linearPeak(limited)
 
-        assertTrue("4x inter-sample peak $measured exceeds $ceilingLinear", measured <= ceilingLinear + 1e-4)
+        assertTrue(
+            "4x inter-sample peak $measured exceeds $ceilingLinear",
+            measured <= ceilingLinear + 1e-4
+        )
     }
 
     @Test
@@ -177,7 +179,7 @@ class DspUnitTest {
         assertEquals(input.channels, mastered.channels)
         assertEquals(input.sampleRate, mastered.sampleRate)
 
-        val ceilingLinear = 10.0.pow(settings.truePeakCeiling / 20.0)
+        val ceilingLinear = 10.0.pow(settings.truePeakCeiling.toDouble() / 20.0)
         val interSamplePeak = TruePeakEstimator.linearPeak(mastered)
         assertTrue(
             "Inter-sample peak $interSamplePeak should respect ceiling $ceilingLinear",

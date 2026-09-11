@@ -45,7 +45,7 @@ data class MasteringSettings(
             "bass" to EQPreset("Bass", 6f, 3f, 0f, -1f, -2f),
             "bright" to EQPreset("Bright", -1f, 0f, 1f, 3f, 5f),
             "warm" to EQPreset("Warm", 3f, 2f, 0f, -2f, -3f),
-            "suno" to EQPreset("Suno AI", 1f, -2f, 1f, -1f, 2f)
+            "suno" to EQPreset("Suno Curve", 1f, -2f, 1f, -1f, 2f)
         )
     }
 }

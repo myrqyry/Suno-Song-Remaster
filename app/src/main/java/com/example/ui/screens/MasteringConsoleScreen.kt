@@ -4,7 +4,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -65,7 +64,6 @@ fun MasteringConsoleScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        // ─── EQ Presets ────────────────────────────────────────────────────────
         SectionCard(title = "EQ PRESETS", icon = Icons.Default.Tune) {
             FlowRow(
                 modifier = Modifier.fillMaxWidth(),
@@ -77,7 +75,12 @@ fun MasteringConsoleScreen(
                     FilterChip(
                         selected = isSelected,
                         onClick = { onPresetSelected(key) },
-                        label = { Text(preset.name, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal) },
+                        label = {
+                            Text(
+                                preset.name,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = StudioPurple,
                             selectedLabelColor = Color.White
@@ -88,7 +91,6 @@ fun MasteringConsoleScreen(
             }
         }
 
-        // ─── 5-Band Equalizer ──────────────────────────────────────────────────
         SectionCard(
             title = "5-BAND MASTERING EQUALIZER",
             trailing = {
@@ -123,12 +125,11 @@ fun MasteringConsoleScreen(
             }
         }
 
-        // ─── DSP Processing Modules ────────────────────────────────────────────
         SectionCard(title = "PROCESSING MODULES") {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 ToggleRow(
                     title = "Clean Low End",
-                    subtitle = "30 Hz Highpass filter removes inaudible sub-rumble",
+                    subtitle = "30 Hz high-pass filter removes inaudible sub-rumble",
                     checked = settings.cleanLowEnd,
                     tag = "clean_low_end_toggle"
                 ) { onSettingsChanged(settings.copy(cleanLowEnd = it)) }
@@ -142,45 +143,43 @@ fun MasteringConsoleScreen(
 
                 ToggleRow(
                     title = "Add Air",
-                    subtitle = "+2.5 dB High Shelf boost at 12 kHz for shimmer",
+                    subtitle = "+2.5 dB high-shelf boost at 12 kHz for shimmer",
                     checked = settings.addAir,
                     tag = "add_air_toggle"
                 ) { onSettingsChanged(settings.copy(addAir = it)) }
 
                 ToggleRow(
                     title = "Tame Harshness",
-                    subtitle = "Dual narrow notches at 4 kHz & 6 kHz to smooth sibilance",
+                    subtitle = "Dual narrow notches at 4 kHz & 6 kHz to smooth harshness",
                     checked = settings.tameHarsh,
                     tag = "tame_harsh_toggle"
                 ) { onSettingsChanged(settings.copy(tameHarsh = it)) }
 
                 ToggleRow(
                     title = "Glue Compression",
-                    subtitle = "3:1 bus compressor (-18 dB threshold, 20ms attack) gels the mix",
+                    subtitle = "3:1 bus compressor (-18 dB threshold, 20 ms attack)",
                     checked = settings.glueCompression,
                     tag = "glue_compression_toggle"
                 ) { onSettingsChanged(settings.copy(glueCompression = it)) }
 
                 ToggleRow(
                     title = "Center Bass (Mono Sub)",
-                    subtitle = "Collapses stereo frequencies below 120 Hz to tight mono",
+                    subtitle = "Reduces side energy below 120 Hz for a tighter center",
                     checked = settings.centerBass,
                     tag = "center_bass_toggle"
                 ) { onSettingsChanged(settings.copy(centerBass = it)) }
 
                 ToggleRow(
-                    title = "True Peak Limiter",
-                    subtitle = "Brickwall limiter prevents inter-sample clipping and distortion",
+                    title = "Inter-sample Peak Limiter",
+                    subtitle = "Export checks 4x cubic inter-sample peaks; preview uses a sample ceiling",
                     checked = settings.truePeakLimit,
                     tag = "true_peak_limit_toggle"
                 ) { onSettingsChanged(settings.copy(truePeakLimit = it)) }
             }
         }
 
-        // ─── Mastering Parameters ──────────────────────────────────────────────
         SectionCard(title = "MASTERING TARGETS & STEREO") {
             Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                // Target LUFS
                 ParamSliderRow(
                     label = "Target Loudness",
                     valueStr = "${settings.targetLufs} LUFS",
@@ -189,16 +188,14 @@ fun MasteringConsoleScreen(
                     tag = "target_lufs_slider"
                 ) { onSettingsChanged(settings.copy(targetLufs = it.toInt())) }
 
-                // True Peak Ceiling
                 ParamSliderRow(
-                    label = "True Peak Ceiling",
-                    valueStr = String.format(Locale.US, "%.1f dBTP", settings.truePeakCeiling),
+                    label = "Inter-sample Ceiling",
+                    valueStr = String.format(Locale.US, "%.1f dBFS", settings.truePeakCeiling),
                     value = settings.truePeakCeiling,
                     range = -3.0f..0.0f,
                     tag = "true_peak_ceiling_slider"
                 ) { onSettingsChanged(settings.copy(truePeakCeiling = it)) }
 
-                // Stereo Width
                 ParamSliderRow(
                     label = "Stereo Width",
                     valueStr = "${settings.stereoWidth}%",
@@ -207,7 +204,6 @@ fun MasteringConsoleScreen(
                     tag = "stereo_width_slider"
                 ) { onSettingsChanged(settings.copy(stereoWidth = it.toInt())) }
 
-                // Input Gain
                 ParamSliderRow(
                     label = "Input Gain",
                     valueStr = String.format(Locale.US, "%+.1f dB", settings.inputGain),
@@ -218,18 +214,24 @@ fun MasteringConsoleScreen(
             }
         }
 
-        // ─── Output Format ─────────────────────────────────────────────────────
         SectionCard(title = "EXPORT FORMAT SPECIFICATIONS") {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Sample Rate",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Export Sample Rate",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Cubic SRC with anti-alias low-pass when downsampling",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                    )
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(44100, 48000).forEach { rate ->
                         val isSel = settings.sampleRate == rate
@@ -264,7 +266,9 @@ fun MasteringConsoleScreen(
                         FilterChip(
                             selected = isSel,
                             onClick = { onSettingsChanged(settings.copy(bitDepth = bits)) },
-                            label = { Text(if (bits == 16) "16-bit (Dithered)" else "24-bit Hi-Res") },
+                            label = {
+                                Text(if (bits == 16) "16-bit (Dithered)" else "24-bit")
+                            },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = StudioPurple,
                                 selectedLabelColor = Color.White
@@ -290,7 +294,11 @@ private fun SectionCard(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f), RoundedCornerShape(16.dp)),
+            .border(
+                1.dp,
+                MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                RoundedCornerShape(16.dp)
+            ),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
         tonalElevation = 2.dp
     ) {
@@ -366,7 +374,11 @@ private fun EqSliderRow(
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.SemiBold,
-            color = if (value != 0f) StudioPurpleLight else MaterialTheme.colorScheme.onSurfaceVariant,
+            color = if (value != 0f) {
+                StudioPurpleLight
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
             modifier = Modifier.width(55.dp)
         )
     }

@@ -17,8 +17,18 @@ class DynamicsProcessor(private val sampleRate: Int) {
      */
     fun processGlueCompression(input: AudioBuffer): AudioBuffer {
         val out = input.copy()
-        val numChannels = out.channels
-        val length = out.length
+        processGlueCompressionInPlace(out)
+        return out
+    }
+
+    /**
+     * Same glue compression as processGlueCompression(), but mutates the
+     * supplied working buffer so loudness analysis does not allocate another
+     * full copy of a decoded song.
+     */
+    fun processGlueCompressionInPlace(buffer: AudioBuffer) {
+        val numChannels = buffer.channels
+        val length = buffer.length
 
         val thresholdDb = AudioConstants.GLUE_THRESHOLD
         val ratio = AudioConstants.GLUE_RATIO
@@ -34,7 +44,7 @@ class DynamicsProcessor(private val sampleRate: Int) {
         for (i in 0 until length) {
             var maxVal = 0f
             for (c in 0 until numChannels) {
-                val a = abs(out.getChannel(c)[i])
+                val a = abs(buffer.getChannel(c)[i])
                 if (a > maxVal) maxVal = a
             }
 
@@ -61,11 +71,9 @@ class DynamicsProcessor(private val sampleRate: Int) {
 
             val gain = 10.0.pow(-grDb / 20.0).toFloat()
             for (c in 0 until numChannels) {
-                out.getChannel(c)[i] *= gain
+                buffer.getChannel(c)[i] *= gain
             }
         }
-
-        return out
     }
 
     /**
@@ -132,7 +140,7 @@ class DynamicsProcessor(private val sampleRate: Int) {
             val safetyGain = (ceilingLinear / interSamplePeak * 0.9999).toFloat()
             for (c in 0 until numChannels) {
                 val data = out.getChannel(c)
-                for (i in data.indices) {
+                for (i in 0 until out.length) {
                     data[i] *= safetyGain
                 }
             }

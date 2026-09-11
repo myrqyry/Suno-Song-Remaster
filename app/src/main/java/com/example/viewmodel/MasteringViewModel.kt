@@ -135,6 +135,22 @@ class MasteringViewModel : ViewModel() {
     fun loadAudioFromUri(context: Context, uri: Uri, fileName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _isLoading.value = true
+
+            // Release the demo/previous song and cancel its analysis before a
+            // new compressed track is decoded. Keeping both full PCM tracks in
+            // memory during MediaCodec decode was a major source of OOM crashes.
+            withContext(Dispatchers.Main) {
+                lufsJob?.cancel()
+                lufsJob = null
+                player.unloadBuffer()
+                _activeBuffer.value = null
+                originalBuffer = null
+                editHistory.clear()
+                _canUndo.value = false
+                _lufsResult.value = null
+                clearSelection()
+            }
+
             try {
                 val buffer = AudioDecoder.decodeFromUri(context, uri)
                 val meta = MetadataReader.readFromUri(context, uri)
@@ -163,7 +179,10 @@ class MasteringViewModel : ViewModel() {
 
     private fun setNewWorkingBuffer(buffer: AudioBuffer, isInitial: Boolean = false) {
         if (isInitial) {
-            originalBuffer = buffer.copy()
+            // Audio edits are copy-on-write, so the initial buffer itself is a
+            // safe immutable reset point. Avoid duplicating the entire decoded
+            // song solely to retain an identical original copy.
+            originalBuffer = buffer
             editHistory.clear()
             _canUndo.value = false
         }
@@ -179,8 +198,7 @@ class MasteringViewModel : ViewModel() {
         val settingsSnapshot = _settings.value
         lufsJob = viewModelScope.launch(Dispatchers.Default) {
             // Measure the same pre-normalization signal that offline export uses.
-            // This keeps preview loudness gain aligned with EQ, glue compression,
-            // stereo width, center-bass and character-filter changes.
+            // AudioMasteringEngine now keeps this to one full working copy.
             val preNormalized = AudioMasteringEngine.processBeforeNormalization(
                 buffer,
                 settingsSnapshot
@@ -269,7 +287,7 @@ class MasteringViewModel : ViewModel() {
         val startSample: Int
         val endSample: Int
 
-        if (selStart != null && selEnd != null && selEnd > selStart) {
+        if (selStart != null && selEnd != null && endSecGreater(selStart, selEnd)) {
             startSample = (selStart * sr).toInt().coerceIn(0, current.length)
             endSample = (selEnd * sr).toInt().coerceIn(startSample, current.length)
         } else if (isFadeIn) {
@@ -300,6 +318,8 @@ class MasteringViewModel : ViewModel() {
         setNewWorkingBuffer(newBuf)
         showStatus("${if (isFadeIn) "Fade In" else "Fade Out"} applied")
     }
+
+    private fun endSecGreater(startSec: Double, endSec: Double): Boolean = endSec > startSec
 
     fun trimToSelection() {
         val current = _activeBuffer.value ?: return

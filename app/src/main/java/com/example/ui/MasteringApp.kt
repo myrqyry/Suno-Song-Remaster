@@ -47,7 +47,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,7 +70,6 @@ import com.example.ui.theme.StudioCyan
 import com.example.ui.theme.StudioGreen
 import com.example.ui.theme.StudioPurple
 import com.example.viewmodel.MasteringViewModel
-import kotlinx.coroutines.launch
 import java.util.Locale
 
 enum class AppNavTab(val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
@@ -87,7 +85,6 @@ fun MasteringApp(
     viewModel: MasteringViewModel = viewModel()
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
     var selectedTab by remember { mutableStateOf(AppNavTab.MASTERING) }
@@ -118,9 +115,7 @@ fun MasteringApp(
     val batchStatusText by viewModel.batchStatusText.collectAsState()
 
     LaunchedEffect(statusMsg) {
-        statusMsg?.let { msg ->
-            snackbarHostState.showSnackbar(msg.text)
-        }
+        statusMsg?.let { msg -> snackbarHostState.showSnackbar(msg.text) }
     }
 
     var isAddingToBatch by remember { mutableStateOf(false) }
@@ -153,9 +148,6 @@ fun MasteringApp(
         }
     }
 
-    // Batch export uses Storage Access Framework instead of writing into the
-    // app-private Android/data directory. The user chooses a real destination
-    // folder and every mastered WAV is created there.
     val batchFolderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { treeUri: Uri? ->
@@ -166,14 +158,19 @@ fun MasteringApp(
                     Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 )
             } catch (_: SecurityException) {
-                // Some providers grant session access without persistable flags.
+                // Some document providers grant session access without persistable flags.
             }
+
+            val parentDocumentUri = DocumentsContract.buildDocumentUriUsingTree(
+                treeUri,
+                DocumentsContract.getTreeDocumentId(treeUri)
+            )
 
             viewModel.runBatchProcessing(context) { item ->
                 val fileName = "${item.name.substringBeforeLast(".")}_mastered.wav"
                 val documentUri = DocumentsContract.createDocument(
                     context.contentResolver,
-                    treeUri,
+                    parentDocumentUri,
                     "audio/wav",
                     fileName
                 )

@@ -2,7 +2,6 @@ package com.example.dsp
 
 import kotlin.math.abs
 import kotlin.math.log10
-import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
@@ -17,8 +16,8 @@ object LufsMeter {
 
     // Filter coefficients for Stage 1 (High-shelf pre-filter)
     private val STAGE1_48K = doubleArrayOf(
-        1.53512485958697, -2.69169618940638, 1.19839281085285, // b0, b1, b2
-        1.0, -1.69065929318241, 0.73248077421585               // a0, a1, a2
+        1.53512485958697, -2.69169618940638, 1.19839281085285,
+        1.0, -1.69065929318241, 0.73248077421585
     )
     private val STAGE1_44K = doubleArrayOf(
         1.53090250011119, -2.65096950211299, 1.16907907994155,
@@ -41,8 +40,11 @@ object LufsMeter {
         var x2 = 0.0
         var y1 = 0.0
         var y2 = 0.0
-        val b0 = b[0]; val b1 = b[1]; val b2 = b[2]
-        val a1 = a[1]; val a2 = a[2]
+        val b0 = b[0]
+        val b1 = b[1]
+        val b2 = b[2]
+        val a1 = a[1]
+        val a2 = a[2]
 
         for (i in input.indices) {
             val x0 = input[i].toDouble()
@@ -57,7 +59,11 @@ object LufsMeter {
     }
 
     /**
-     * ITU-R BS.1770-4 Integrated LUFS measurement
+     * ITU-R BS.1770-style integrated loudness measurement for the sample rates
+     * supported by the current Android UI (44.1/48 kHz).
+     *
+     * truePeakDb is a 4x cubic inter-sample estimate from TruePeakEstimator. It
+     * must not be presented as standards-certified dBTP.
      */
     fun measure(buffer: AudioBuffer, targetLufs: Int = AudioConstants.TARGET_LUFS_DEFAULT): LufsResult {
         val sampleRate = buffer.sampleRate
@@ -83,10 +89,16 @@ object LufsMeter {
                 if (a > samplePeak) samplePeak = a
             }
             val stage1 = applyIir(raw, b1, a1)
-            // Apply stage 2
-            var x1 = 0.0; var x2 = 0.0; var y1 = 0.0; var y2 = 0.0
-            val b20 = b2[0]; val b21 = b2[1]; val b22 = b2[2]
-            val a21 = a2[1]; val a22 = a2[2]
+
+            var x1 = 0.0
+            var x2 = 0.0
+            var y1 = 0.0
+            var y2 = 0.0
+            val b20 = b2[0]
+            val b21 = b2[1]
+            val b22 = b2[2]
+            val a21 = a2[1]
+            val a22 = a2[2]
             val dst = filtered[ch]
 
             for (i in stage1.indices) {
@@ -105,14 +117,12 @@ object LufsMeter {
         val numBlocks = (buffer.length - blockSize) / hopSize + 1
 
         val samplePeakDb = if (samplePeak > 1e-6) 20.0 * log10(samplePeak) else -96.0
-        // Inter-sample true peak approximation (sample peak + 0.5dB margin or 4x interpolation)
-        val truePeakDb = samplePeakDb + 0.3
+        val truePeakDb = TruePeakEstimator.dbPeak(buffer)
 
         if (numBlocks <= 0) {
             return LufsResult(-96.0, samplePeakDb, truePeakDb, 1.0f)
         }
 
-        // Calculate mean square per block
         val blockLoudness = DoubleArray(numBlocks)
         val blockMeanSquare = DoubleArray(numBlocks)
 
@@ -135,7 +145,6 @@ object LufsMeter {
             blockLoudness[b] = if (sumSquare > 1e-12) -0.691 + 10.0 * log10(sumSquare) else -96.0
         }
 
-        // Step 1: Absolute threshold gating (-70 LUFS)
         var absCount = 0
         var absSum = 0.0
         for (b in 0 until numBlocks) {
@@ -152,11 +161,13 @@ object LufsMeter {
         val absLoudness = -0.691 + 10.0 * log10(absSum / absCount)
         val relThreshold = absLoudness + AudioConstants.RELATIVE_THRESHOLD_LU
 
-        // Step 2: Relative threshold gating
         var relCount = 0
         var relSum = 0.0
         for (b in 0 until numBlocks) {
-            if (blockLoudness[b] > AudioConstants.ABSOLUTE_THRESHOLD_LUFS && blockLoudness[b] > relThreshold) {
+            if (
+                blockLoudness[b] > AudioConstants.ABSOLUTE_THRESHOLD_LUFS &&
+                blockLoudness[b] > relThreshold
+            ) {
                 relSum += blockMeanSquare[b]
                 relCount++
             }
@@ -178,7 +189,10 @@ object LufsMeter {
         )
     }
 
-    fun calculateNormalizationGain(currentLufs: Double, targetLufs: Double = AudioConstants.TARGET_LUFS_DEFAULT.toDouble()): Float {
+    fun calculateNormalizationGain(
+        currentLufs: Double,
+        targetLufs: Double = AudioConstants.TARGET_LUFS_DEFAULT.toDouble()
+    ): Float {
         if (currentLufs <= -70.0 || !currentLufs.isFinite()) return 1.0f
         val gainDb = targetLufs - currentLufs
         val gain = 10.0.pow(gainDb / 20.0)

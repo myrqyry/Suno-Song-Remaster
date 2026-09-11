@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AI Music Remastering"
+rootProject.name = "Suno Song Remaster"
 include(":app")

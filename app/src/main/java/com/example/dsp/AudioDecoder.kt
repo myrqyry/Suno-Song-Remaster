@@ -9,19 +9,24 @@ import android.net.Uri
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 import java.util.ArrayList
 
 object AudioDecoder {
 
     fun decodeFromUri(context: Context, uri: Uri): AudioBuffer {
-        // First try fast direct WAV decoder.
-        try {
-            context.contentResolver.openInputStream(uri)?.use { stream ->
-                val buffer = decodeWavStream(stream)
-                if (buffer != null) return buffer
+        // Only invoke the whole-file WAV parser after a tiny 12-byte sniff.
+        // Previously every MP3 was read fully into a ByteArray before being
+        // rejected as non-WAV, creating a large avoidable memory spike.
+        if (looksLikeWav(context, uri)) {
+            try {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val buffer = decodeWavStream(stream)
+                    if (buffer != null) return buffer
+                }
+            } catch (_: Exception) {
+                // Fall through to MediaCodec for unsupported/malformed WAV.
             }
-        } catch (_: Exception) {
-            // Fall through to MediaCodec for compressed/unsupported WAV input.
         }
 
         val extractor = MediaExtractor()
@@ -111,12 +116,17 @@ object AudioDecoder {
                                 .coerceIn(1, 2)
                         }
                         if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
-                            pcmEncoding = outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                            val reportedEncoding = outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                            if (reportedEncoding == AudioFormat.ENCODING_PCM_8BIT ||
+                                reportedEncoding == AudioFormat.ENCODING_PCM_16BIT ||
+                                reportedEncoding == AudioFormat.ENCODING_PCM_FLOAT
+                            ) {
+                                pcmEncoding = reportedEncoding
+                            }
                         }
                     }
 
-                    MediaCodec.INFO_TRY_AGAIN_LATER,
-                    MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
 
                     else -> if (outputIndex >= 0) {
                         val outputBuffer = codec.getOutputBuffer(outputIndex)
@@ -160,6 +170,9 @@ object AudioDecoder {
                 }
             }
 
+            // Drop references to the temporary decoded chunks before returning
+            // the final planar AudioBuffer so GC can reclaim them immediately.
+            pcmChunks.clear()
             return audioBuffer
         } finally {
             try {
@@ -174,6 +187,25 @@ object AudioDecoder {
                 extractor.release()
             } catch (_: Exception) {
             }
+        }
+    }
+
+    private fun looksLikeWav(context: Context, uri: Uri): Boolean {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                val header = ByteArray(12)
+                var offset = 0
+                while (offset < header.size) {
+                    val read = stream.read(header, offset, header.size - offset)
+                    if (read <= 0) break
+                    offset += read
+                }
+                offset == 12 &&
+                    String(header, 0, 4, StandardCharsets.US_ASCII) == "RIFF" &&
+                    String(header, 8, 4, StandardCharsets.US_ASCII) == "WAVE"
+            } ?: false
+        } catch (_: Exception) {
+            false
         }
     }
 

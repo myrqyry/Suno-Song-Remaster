@@ -6,47 +6,40 @@ import kotlin.math.pow
 object AudioMasteringEngine {
 
     /**
-     * Executes the complete offline mastering DSP pipeline on an AudioBuffer.
-     *
-     * Export sample-rate conversion happens after tone/dynamics/loudness work
-     * and before the final inter-sample limiter so the ceiling is enforced on
-     * the actual exported sample grid.
+     * Runs every stage that occurs before loudness normalization. Keeping this
+     * as one shared function lets the preview calculate its normalization gain
+     * from the same EQ/compression/stereo chain used by offline export.
      */
-    fun processOffline(
+    fun processBeforeNormalization(
         inputBuffer: AudioBuffer,
         settings: MasteringSettings,
-        precalculatedLufsGain: Float? = null,
         onProgress: ((Float) -> Unit)? = null
     ): AudioBuffer {
         val sr = inputBuffer.sampleRate.toDouble()
-        onProgress?.invoke(0.1f)
+        var current = inputBuffer.copy()
 
         // 1. Input Gain
-        var current = inputBuffer.copy()
         if (settings.inputGain != 0.0f) {
             val linearGain = 10.0.pow(settings.inputGain.toDouble() / 20.0).toFloat()
             for (c in 0 until current.channels) {
                 val data = current.getChannel(c)
-                for (i in 0 until current.length) {
-                    data[i] *= linearGain
-                }
+                for (i in data.indices) data[i] *= linearGain
             }
         }
-        onProgress?.invoke(0.2f)
+        onProgress?.invoke(0.15f)
 
-        // 2. Clean Low End (30Hz Highpass)
+        // 2. Clean Low End (30 Hz high-pass)
         if (settings.cleanLowEnd) {
-            val hp = BiquadFilter(
+            current = BiquadFilter(
                 BiquadType.HIGHPASS,
                 AudioConstants.HIGHPASS_FREQ,
                 sr,
                 q = 0.707
-            )
-            current = hp.processBuffer(current)
+            ).processBuffer(current)
         }
         onProgress?.invoke(0.3f)
 
-        // 3. 5-Band Equalizer
+        // 3. 5-band EQ
         if (settings.eqLow != 0.0f) {
             current = BiquadFilter(
                 BiquadType.LOWSHELF,
@@ -90,9 +83,9 @@ object AudioMasteringEngine {
                 gainDb = settings.eqHigh.toDouble()
             ).processBuffer(current)
         }
-        onProgress?.invoke(0.45f)
+        onProgress?.invoke(0.5f)
 
-        // 4. Character Filters: Cut Mud, Add Air, Tame Harsh
+        // 4. Character filters
         if (settings.cutMud) {
             current = BiquadFilter(
                 BiquadType.PEAKING,
@@ -126,42 +119,60 @@ object AudioMasteringEngine {
                 gainDb = AudioConstants.HARSHNESS_GAIN_6K
             ).processBuffer(current)
         }
-        onProgress?.invoke(0.6f)
+        onProgress?.invoke(0.65f)
 
-        // 5. Glue Compressor
+        // 5. Glue compressor
         if (settings.glueCompression) {
             current = DynamicsProcessor(current.sampleRate).processGlueCompression(current)
         }
-        onProgress?.invoke(0.7f)
+        onProgress?.invoke(0.8f)
 
-        // 6. Mid-Side Stereo Processing & Center Bass
+        // 6. Mid/side stereo processing & center bass
         current = StereoProcessor(current.sampleRate).process(
             current,
             settings.stereoWidth,
             settings.centerBass
         )
-        onProgress?.invoke(0.8f)
+        onProgress?.invoke(1.0f)
 
-        // 7. Loudness Normalization
+        return current
+    }
+
+    /**
+     * Executes the complete offline mastering pipeline.
+     *
+     * Export sample-rate conversion happens after tone/dynamics/loudness work
+     * and before the final inter-sample limiter so the ceiling is enforced on
+     * the actual exported sample grid.
+     */
+    fun processOffline(
+        inputBuffer: AudioBuffer,
+        settings: MasteringSettings,
+        precalculatedLufsGain: Float? = null,
+        onProgress: ((Float) -> Unit)? = null
+    ): AudioBuffer {
+        var current = processBeforeNormalization(inputBuffer, settings) { preProgress ->
+            onProgress?.invoke(preProgress * 0.72f)
+        }
+
+        // 7. Loudness normalization
         if (settings.normalizeLoudness) {
-            val normGain = precalculatedLufsGain ?: run {
-                LufsMeter.measure(current, settings.targetLufs).normalizationGain
-            }
+            val normGain = precalculatedLufsGain ?: LufsMeter
+                .measure(current, settings.targetLufs)
+                .normalizationGain
             for (c in 0 until current.channels) {
                 val data = current.getChannel(c)
-                for (i in 0 until current.length) {
-                    data[i] *= normGain
-                }
+                for (i in data.indices) data[i] *= normGain
             }
         }
-        onProgress?.invoke(0.88f)
+        onProgress?.invoke(0.82f)
 
-        // 8. Export sample-rate conversion. This control now changes the bytes
-        // that are written instead of being UI-only state.
+        // 8. Export sample-rate conversion. The output-format control changes
+        // the actual AudioBuffer rate and frame count.
         if (settings.sampleRate != current.sampleRate) {
             current = AudioResampler.resample(current, settings.sampleRate)
         }
-        onProgress?.invoke(0.94f)
+        onProgress?.invoke(0.92f)
 
         // 9. Final inter-sample ceiling at the exported sample rate.
         if (settings.truePeakLimit) {

@@ -7,6 +7,10 @@ object AudioMasteringEngine {
 
     /**
      * Executes the complete offline mastering DSP pipeline on an AudioBuffer.
+     *
+     * Export sample-rate conversion happens after tone/dynamics/loudness work
+     * and before the final inter-sample limiter so the ceiling is enforced on
+     * the actual exported sample grid.
      */
     fun processOffline(
         inputBuffer: AudioBuffer,
@@ -32,68 +36,116 @@ object AudioMasteringEngine {
 
         // 2. Clean Low End (30Hz Highpass)
         if (settings.cleanLowEnd) {
-            val hp = BiquadFilter(BiquadType.HIGHPASS, AudioConstants.HIGHPASS_FREQ, sr, q = 0.707)
+            val hp = BiquadFilter(
+                BiquadType.HIGHPASS,
+                AudioConstants.HIGHPASS_FREQ,
+                sr,
+                q = 0.707
+            )
             current = hp.processBuffer(current)
         }
         onProgress?.invoke(0.3f)
 
         // 3. 5-Band Equalizer
         if (settings.eqLow != 0.0f) {
-            val lowFilter = BiquadFilter(BiquadType.LOWSHELF, AudioConstants.FREQ_LOW, sr, gainDb = settings.eqLow.toDouble())
-            current = lowFilter.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.LOWSHELF,
+                AudioConstants.FREQ_LOW,
+                sr,
+                gainDb = settings.eqLow.toDouble()
+            ).processBuffer(current)
         }
         if (settings.eqLowMid != 0.0f) {
-            val lowMidFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.FREQ_LOW_MID, sr, q = 1.0, gainDb = settings.eqLowMid.toDouble())
-            current = lowMidFilter.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.PEAKING,
+                AudioConstants.FREQ_LOW_MID,
+                sr,
+                q = 1.0,
+                gainDb = settings.eqLowMid.toDouble()
+            ).processBuffer(current)
         }
         if (settings.eqMid != 0.0f) {
-            val midFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.FREQ_MID, sr, q = 1.0, gainDb = settings.eqMid.toDouble())
-            current = midFilter.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.PEAKING,
+                AudioConstants.FREQ_MID,
+                sr,
+                q = 1.0,
+                gainDb = settings.eqMid.toDouble()
+            ).processBuffer(current)
         }
         if (settings.eqHighMid != 0.0f) {
-            val highMidFilter = BiquadFilter(BiquadType.PEAKING, AudioConstants.FREQ_HIGH_MID, sr, q = 1.0, gainDb = settings.eqHighMid.toDouble())
-            current = highMidFilter.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.PEAKING,
+                AudioConstants.FREQ_HIGH_MID,
+                sr,
+                q = 1.0,
+                gainDb = settings.eqHighMid.toDouble()
+            ).processBuffer(current)
         }
         if (settings.eqHigh != 0.0f) {
-            val highFilter = BiquadFilter(BiquadType.HIGHSHELF, AudioConstants.FREQ_HIGH, sr, gainDb = settings.eqHigh.toDouble())
-            current = highFilter.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.HIGHSHELF,
+                AudioConstants.FREQ_HIGH,
+                sr,
+                gainDb = settings.eqHigh.toDouble()
+            ).processBuffer(current)
         }
         onProgress?.invoke(0.45f)
 
         // 4. Character Filters: Cut Mud, Add Air, Tame Harsh
         if (settings.cutMud) {
-            val mud = BiquadFilter(BiquadType.PEAKING, AudioConstants.MUD_CUT_FREQ, sr, q = 1.5, gainDb = -3.0)
-            current = mud.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.PEAKING,
+                AudioConstants.MUD_CUT_FREQ,
+                sr,
+                q = 1.5,
+                gainDb = -3.0
+            ).processBuffer(current)
         }
         if (settings.addAir) {
-            val air = BiquadFilter(BiquadType.HIGHSHELF, AudioConstants.AIR_FREQ, sr, gainDb = 2.5)
-            current = air.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.HIGHSHELF,
+                AudioConstants.AIR_FREQ,
+                sr,
+                gainDb = 2.5
+            ).processBuffer(current)
         }
         if (settings.tameHarsh) {
-            val harsh1 = BiquadFilter(BiquadType.PEAKING, AudioConstants.HARSHNESS_FREQ_1, sr, q = AudioConstants.HARSHNESS_Q_4K, gainDb = AudioConstants.HARSHNESS_GAIN_4K)
-            current = harsh1.processBuffer(current)
-            val harsh2 = BiquadFilter(BiquadType.PEAKING, AudioConstants.HARSHNESS_FREQ_2, sr, q = AudioConstants.HARSHNESS_Q_6K, gainDb = AudioConstants.HARSHNESS_GAIN_6K)
-            current = harsh2.processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.PEAKING,
+                AudioConstants.HARSHNESS_FREQ_1,
+                sr,
+                q = AudioConstants.HARSHNESS_Q_4K,
+                gainDb = AudioConstants.HARSHNESS_GAIN_4K
+            ).processBuffer(current)
+            current = BiquadFilter(
+                BiquadType.PEAKING,
+                AudioConstants.HARSHNESS_FREQ_2,
+                sr,
+                q = AudioConstants.HARSHNESS_Q_6K,
+                gainDb = AudioConstants.HARSHNESS_GAIN_6K
+            ).processBuffer(current)
         }
         onProgress?.invoke(0.6f)
 
         // 5. Glue Compressor
-        val dyn = DynamicsProcessor(inputBuffer.sampleRate)
         if (settings.glueCompression) {
-            current = dyn.processGlueCompression(current)
+            current = DynamicsProcessor(current.sampleRate).processGlueCompression(current)
         }
         onProgress?.invoke(0.7f)
 
         // 6. Mid-Side Stereo Processing & Center Bass
-        val stereo = StereoProcessor(inputBuffer.sampleRate)
-        current = stereo.process(current, settings.stereoWidth, settings.centerBass)
+        current = StereoProcessor(current.sampleRate).process(
+            current,
+            settings.stereoWidth,
+            settings.centerBass
+        )
         onProgress?.invoke(0.8f)
 
-        // 7. Loudness Normalization (ITU-R BS.1770-4)
+        // 7. Loudness Normalization
         if (settings.normalizeLoudness) {
             val normGain = precalculatedLufsGain ?: run {
-                val lufsRes = LufsMeter.measure(current, settings.targetLufs)
-                lufsRes.normalizationGain
+                LufsMeter.measure(current, settings.targetLufs).normalizationGain
             }
             for (c in 0 until current.channels) {
                 val data = current.getChannel(c)
@@ -102,11 +154,19 @@ object AudioMasteringEngine {
                 }
             }
         }
-        onProgress?.invoke(0.9f)
+        onProgress?.invoke(0.88f)
 
-        // 8. True Peak Limiter & Ceiling
+        // 8. Export sample-rate conversion. This control now changes the bytes
+        // that are written instead of being UI-only state.
+        if (settings.sampleRate != current.sampleRate) {
+            current = AudioResampler.resample(current, settings.sampleRate)
+        }
+        onProgress?.invoke(0.94f)
+
+        // 9. Final inter-sample ceiling at the exported sample rate.
         if (settings.truePeakLimit) {
-            current = dyn.processLimiter(current, settings.truePeakCeiling)
+            current = DynamicsProcessor(current.sampleRate)
+                .processLimiter(current, settings.truePeakCeiling)
         }
 
         onProgress?.invoke(1.0f)

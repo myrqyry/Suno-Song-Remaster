@@ -16,18 +16,11 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
-    signingConfigs {
-        getByName("debug") {
-            storeFile = file("${rootDir}/debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
-        }
-    }
-
     buildTypes {
         debug {
-            signingConfig = signingConfigs.getByName("debug")
+            // Use Android's generated debug keystore. The previous config
+            // pointed at a repository-local debug.keystore that was not
+            // committed, making clean/CI builds fail for no reason.
         }
         release {
             isMinifyEnabled = false

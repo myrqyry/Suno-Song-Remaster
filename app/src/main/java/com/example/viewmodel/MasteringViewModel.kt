@@ -5,7 +5,6 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.dsp.AudioBuffer
-import com.example.dsp.AudioConstants
 import com.example.dsp.AudioDecoder
 import com.example.dsp.AudioMasteringEngine
 import com.example.dsp.LufsMeter
@@ -18,8 +17,8 @@ import com.example.model.BatchItem
 import com.example.model.BatchStatus
 import com.example.model.MasteringSettings
 import com.example.player.MasteringPlayer
-import com.example.player.MeterData
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,8 +46,9 @@ class MasteringViewModel : ViewModel() {
 
     private var originalBuffer: AudioBuffer? = null
     private val editHistory = mutableListOf<AudioBuffer>()
+    private var lufsJob: Job? = null
 
-    private val _currentFileName = MutableStateFlow("Demo - AI Synthwave Groove")
+    private val _currentFileName = MutableStateFlow("Demo - Synthwave Groove")
     val currentFileName: StateFlow<String> = _currentFileName.asStateFlow()
 
     private val _settings = MutableStateFlow(MasteringSettings())
@@ -57,18 +57,19 @@ class MasteringViewModel : ViewModel() {
     private val _lufsResult = MutableStateFlow<LufsResult?>(null)
     val lufsResult: StateFlow<LufsResult?> = _lufsResult.asStateFlow()
 
-    private val _metadata = MutableStateFlow(AudioMetadata(
-        title = "AI Synthwave Anthem",
-        artist = "Suno AI Remaster",
-        album = "Remastered Hits",
-        genre = "Synthwave / Electronic",
-        year = "2026",
-        track = "1",
-        comment = "Mastered with AI Music Remastering Studio"
-    ))
+    private val _metadata = MutableStateFlow(
+        AudioMetadata(
+            title = "Synthwave Anthem",
+            artist = "Suno Song Remaster",
+            album = "Remastered Hits",
+            genre = "Synthwave / Electronic",
+            year = "2026",
+            track = "1",
+            comment = "Mastered with Suno Song Remaster"
+        )
+    )
     val metadata: StateFlow<AudioMetadata> = _metadata.asStateFlow()
 
-    // Editor state
     private val _selectionStart = MutableStateFlow<Double?>(null)
     val selectionStart: StateFlow<Double?> = _selectionStart.asStateFlow()
 
@@ -84,7 +85,6 @@ class MasteringViewModel : ViewModel() {
     private val _loopEnabled = MutableStateFlow(false)
     val loopEnabled: StateFlow<Boolean> = _loopEnabled.asStateFlow()
 
-    // Batch state
     private val _batchQueue = MutableStateFlow<List<BatchItem>>(emptyList())
     val batchQueue: StateFlow<List<BatchItem>> = _batchQueue.asStateFlow()
 
@@ -97,16 +97,13 @@ class MasteringViewModel : ViewModel() {
     private val _batchStatusText = MutableStateFlow("")
     val batchStatusText: StateFlow<String> = _batchStatusText.asStateFlow()
 
-    // Status banner
     private val _statusMessage = MutableStateFlow<UiStatusMessage?>(null)
     val statusMessage: StateFlow<UiStatusMessage?> = _statusMessage.asStateFlow()
 
-    // Is loading
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     init {
-        // Automatically load demo audio so app is immediately alive and ready to play/test
         loadDemoTrack("synthwave")
     }
 
@@ -126,7 +123,7 @@ class MasteringViewModel : ViewModel() {
                 _currentFileName.value = when (type) {
                     "acoustic" -> "Demo - Acoustic Sunset.wav"
                     "lofi" -> "Demo - Lo-Fi Chill Beat.wav"
-                    else -> "Demo - AI Synthwave Groove.wav"
+                    else -> "Demo - Synthwave Groove.wav"
                 }
                 setNewWorkingBuffer(buffer, isInitial = true)
                 _isLoading.value = false
@@ -138,15 +135,31 @@ class MasteringViewModel : ViewModel() {
     fun loadAudioFromUri(context: Context, uri: Uri, fileName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _isLoading.value = true
+
+            // Release the demo/previous song and cancel its analysis before a
+            // new compressed track is decoded. Keeping both full PCM tracks in
+            // memory during MediaCodec decode was a major source of OOM crashes.
+            withContext(Dispatchers.Main) {
+                lufsJob?.cancel()
+                lufsJob = null
+                player.unloadBuffer()
+                _activeBuffer.value = null
+                originalBuffer = null
+                editHistory.clear()
+                _canUndo.value = false
+                _lufsResult.value = null
+                clearSelection()
+            }
+
             try {
                 val buffer = AudioDecoder.decodeFromUri(context, uri)
                 val meta = MetadataReader.readFromUri(context, uri)
                 withContext(Dispatchers.Main) {
                     _currentFileName.value = fileName
-                    if (meta.hasAny()) {
-                        _metadata.value = meta
+                    _metadata.value = if (meta.hasAny()) {
+                        meta
                     } else {
-                        _metadata.value = AudioMetadata(title = fileName.substringBeforeLast("."))
+                        AudioMetadata(title = fileName.substringBeforeLast("."))
                     }
                     setNewWorkingBuffer(buffer, isInitial = true)
                     _isLoading.value = false
@@ -155,7 +168,10 @@ class MasteringViewModel : ViewModel() {
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     _isLoading.value = false
-                    showStatus("Error loading audio: ${e.localizedMessage ?: "Unknown error"}", isError = true)
+                    showStatus(
+                        "Error loading audio: ${e.localizedMessage ?: "Unknown error"}",
+                        isError = true
+                    )
                 }
             }
         }
@@ -163,19 +179,31 @@ class MasteringViewModel : ViewModel() {
 
     private fun setNewWorkingBuffer(buffer: AudioBuffer, isInitial: Boolean = false) {
         if (isInitial) {
-            originalBuffer = buffer.copy()
+            // Audio edits are copy-on-write, so the initial buffer itself is a
+            // safe immutable reset point. Avoid duplicating the entire decoded
+            // song solely to retain an identical original copy.
+            originalBuffer = buffer
             editHistory.clear()
             _canUndo.value = false
         }
         _activeBuffer.value = buffer
         player.loadBuffer(buffer)
+        player.settings = _settings.value
         recomputeLufs(buffer)
         clearSelection()
     }
 
     private fun recomputeLufs(buffer: AudioBuffer) {
-        viewModelScope.launch(Dispatchers.Default) {
-            val result = LufsMeter.measure(buffer, _settings.value.targetLufs)
+        lufsJob?.cancel()
+        val settingsSnapshot = _settings.value
+        lufsJob = viewModelScope.launch(Dispatchers.Default) {
+            // Measure the same pre-normalization signal that offline export uses.
+            // AudioMasteringEngine now keeps this to one full working copy.
+            val preNormalized = AudioMasteringEngine.processBeforeNormalization(
+                buffer,
+                settingsSnapshot
+            )
+            val result = LufsMeter.measure(preNormalized, settingsSnapshot.targetLufs)
             _lufsResult.value = result
             player.normGain = result.normalizationGain
         }
@@ -184,9 +212,7 @@ class MasteringViewModel : ViewModel() {
     fun updateSettings(newSettings: MasteringSettings) {
         _settings.value = newSettings.clamped()
         player.settings = _settings.value
-        _activeBuffer.value?.let { buf ->
-            recomputeLufs(buf)
-        }
+        _activeBuffer.value?.let { buffer -> recomputeLufs(buffer) }
     }
 
     fun setPreset(presetKey: String) {
@@ -207,10 +233,14 @@ class MasteringViewModel : ViewModel() {
     fun toggleBypass() {
         player.toggleBypass()
         val isBypassed = player.isBypass.value
-        showStatus(if (isBypassed) "Mastering Bypassed (Original Audio)" else "Mastering Active (Processed Audio)")
+        showStatus(
+            if (isBypassed) {
+                "Mastering Bypassed (Original Audio)"
+            } else {
+                "Mastering Active (Processed Audio)"
+            }
+        )
     }
-
-    // ─── Editor Actions ─────────────────────────────────────────────────────────
 
     fun setSelection(startSec: Double?, endSec: Double?) {
         if (startSec != null && endSec != null && endSec > startSec) {
@@ -257,7 +287,7 @@ class MasteringViewModel : ViewModel() {
         val startSample: Int
         val endSample: Int
 
-        if (selStart != null && selEnd != null && selEnd > selStart) {
+        if (selStart != null && selEnd != null && endSecGreater(selStart, selEnd)) {
             startSample = (selStart * sr).toInt().coerceIn(0, current.length)
             endSample = (selEnd * sr).toInt().coerceIn(startSample, current.length)
         } else if (isFadeIn) {
@@ -274,16 +304,22 @@ class MasteringViewModel : ViewModel() {
         pushHistory()
         val newBuf = current.copy()
         for (c in 0 until newBuf.channels) {
-            val d = newBuf.getChannel(c)
+            val data = newBuf.getChannel(c)
             for (i in startSample until endSample) {
-                val p = (i - startSample).toDouble() / range
-                val gain = if (isFadeIn) sin(p * PI / 2.0) else cos(p * PI / 2.0)
-                d[i] = (d[i] * gain).toFloat()
+                val progress = (i - startSample).toDouble() / range
+                val gain = if (isFadeIn) {
+                    sin(progress * PI / 2.0)
+                } else {
+                    cos(progress * PI / 2.0)
+                }
+                data[i] = (data[i] * gain).toFloat()
             }
         }
         setNewWorkingBuffer(newBuf)
         showStatus("${if (isFadeIn) "Fade In" else "Fade Out"} applied")
     }
+
+    private fun endSecGreater(startSec: Double, endSec: Double): Boolean = endSec > startSec
 
     fun trimToSelection() {
         val current = _activeBuffer.value ?: return
@@ -297,12 +333,10 @@ class MasteringViewModel : ViewModel() {
         val sr = current.sampleRate
         val startSample = (startSec * sr).toInt().coerceIn(0, current.length)
         val endSample = (endSec * sr).toInt().coerceIn(startSample, current.length)
-
         if (endSample - startSample < 100) return
 
         pushHistory()
-        val newBuf = current.slice(startSample, endSample)
-        setNewWorkingBuffer(newBuf)
+        setNewWorkingBuffer(current.slice(startSample, endSample))
         showStatus("Trimmed to selection")
     }
 
@@ -316,22 +350,21 @@ class MasteringViewModel : ViewModel() {
         }
 
         val sr = current.sampleRate
-        val s = (startSec * sr).toInt().coerceIn(0, current.length)
-        val e = (endSec * sr).toInt().coerceIn(s, current.length)
-        val cutLen = e - s
-        val newLen = current.length - cutLen
-        if (newLen <= 0) {
+        val start = (startSec * sr).toInt().coerceIn(0, current.length)
+        val end = (endSec * sr).toInt().coerceIn(start, current.length)
+        val newLength = current.length - (end - start)
+        if (newLength <= 0) {
             showStatus("Cannot delete the entire audio track", isError = true)
             return
         }
 
         pushHistory()
-        val newBuf = AudioBuffer(current.channels, newLen, sr)
+        val newBuf = AudioBuffer(current.channels, newLength, sr)
         for (c in 0 until current.channels) {
             val src = current.getChannel(c)
             val dst = newBuf.getChannel(c)
-            System.arraycopy(src, 0, dst, 0, s)
-            System.arraycopy(src, e, dst, s, current.length - e)
+            System.arraycopy(src, 0, dst, 0, start)
+            System.arraycopy(src, end, dst, start, current.length - end)
         }
 
         setNewWorkingBuffer(newBuf)
@@ -348,16 +381,14 @@ class MasteringViewModel : ViewModel() {
         }
 
         val sr = current.sampleRate
-        val s = (startSec * sr).toInt().coerceIn(0, current.length)
-        val e = (endSec * sr).toInt().coerceIn(s, current.length)
+        val start = (startSec * sr).toInt().coerceIn(0, current.length)
+        val end = (endSec * sr).toInt().coerceIn(start, current.length)
 
         pushHistory()
         val newBuf = current.copy()
         for (c in 0 until newBuf.channels) {
-            val d = newBuf.getChannel(c)
-            for (i in s until e) {
-                d[i] = 0f
-            }
+            val data = newBuf.getChannel(c)
+            for (i in start until end) data[i] = 0f
         }
         setNewWorkingBuffer(newBuf)
         showStatus("Selection silenced")
@@ -372,15 +403,13 @@ class MasteringViewModel : ViewModel() {
         }
 
         pushHistory()
-        val targetLinear = 10.0.pow(-0.3 / 20.0).toFloat() // -0.3 dBFS peak
+        val targetLinear = 10.0.pow(-0.3 / 20.0).toFloat()
         val gain = targetLinear / peak
 
         val newBuf = current.copy()
         for (c in 0 until newBuf.channels) {
-            val d = newBuf.getChannel(c)
-            for (i in 0 until newBuf.length) {
-                d[i] *= gain
-            }
+            val data = newBuf.getChannel(c)
+            for (i in data.indices) data[i] *= gain
         }
         setNewWorkingBuffer(newBuf)
         showStatus("Peak normalized to -0.3 dBFS")
@@ -390,51 +419,58 @@ class MasteringViewModel : ViewModel() {
         val current = _activeBuffer.value ?: return
         val startSec = _selectionStart.value
         val endSec = _selectionEnd.value
-
         val sr = current.sampleRate
-        val s = if (startSec != null && endSec != null && endSec > startSec) {
-            (startSec * sr).toInt().coerceIn(0, current.length)
-        } else 0
 
-        val e = if (startSec != null && endSec != null && endSec > startSec) {
-            (endSec * sr).toInt().coerceIn(s, current.length)
-        } else current.length
+        val start = if (startSec != null && endSec != null && endSec > startSec) {
+            (startSec * sr).toInt().coerceIn(0, current.length)
+        } else {
+            0
+        }
+        val end = if (startSec != null && endSec != null && endSec > startSec) {
+            (endSec * sr).toInt().coerceIn(start, current.length)
+        } else {
+            current.length
+        }
 
         pushHistory()
         val newBuf = current.copy()
         for (c in 0 until newBuf.channels) {
-            val d = newBuf.getChannel(c)
-            var lo = s
-            var hi = e - 1
-            while (lo < hi) {
-                val tmp = d[lo]
-                d[lo] = d[hi]
-                d[hi] = tmp
-                lo++
-                hi--
+            val data = newBuf.getChannel(c)
+            var low = start
+            var high = end - 1
+            while (low < high) {
+                val tmp = data[low]
+                data[low] = data[high]
+                data[high] = tmp
+                low++
+                high--
             }
         }
         setNewWorkingBuffer(newBuf)
-        showStatus(if (s == 0 && e == current.length) "Track reversed" else "Selection reversed")
+        showStatus(
+            if (start == 0 && end == current.length) {
+                "Track reversed"
+            } else {
+                "Selection reversed"
+            }
+        )
     }
 
     fun undoEdit() {
         if (editHistory.isEmpty()) return
-        val prev = editHistory.removeAt(editHistory.size - 1)
+        val previous = editHistory.removeAt(editHistory.lastIndex)
         _canUndo.value = editHistory.isNotEmpty()
-        setNewWorkingBuffer(prev)
+        setNewWorkingBuffer(previous)
         showStatus("Edit undone")
     }
 
     fun resetToOriginal() {
-        val orig = originalBuffer ?: return
+        val original = originalBuffer ?: return
         editHistory.clear()
         _canUndo.value = false
-        setNewWorkingBuffer(orig.copy())
+        setNewWorkingBuffer(original.copy())
         showStatus("Reverted to original audio")
     }
-
-    // ─── Metadata ──────────────────────────────────────────────────────────────
 
     fun updateMetadata(newMeta: AudioMetadata) {
         _metadata.value = newMeta
@@ -447,8 +483,6 @@ class MasteringViewModel : ViewModel() {
         }
         showStatus("Applied metadata to all ${_batchQueue.value.size} tracks in batch")
     }
-
-    // ─── Batch Queue ───────────────────────────────────────────────────────────
 
     fun addBatchItem(name: String, uri: Uri?, sampleType: String? = null) {
         val item = BatchItem(
@@ -470,7 +504,10 @@ class MasteringViewModel : ViewModel() {
         _batchQueue.value = emptyList()
     }
 
-    fun runBatchProcessing(context: Context, outputStreamProvider: (BatchItem) -> OutputStream?) {
+    fun runBatchProcessing(
+        context: Context,
+        outputStreamProvider: (BatchItem) -> OutputStream?
+    ) {
         val queue = _batchQueue.value
         if (queue.isEmpty() || _isBatchProcessing.value) return
 
@@ -484,8 +521,6 @@ class MasteringViewModel : ViewModel() {
                 val item = queue[i]
                 _batchStatusText.value = "Processing ${i + 1}/$total: ${item.name}"
                 _batchProgress.value = i.toFloat() / total
-
-                // Update item status to processing
                 _batchQueue.value = _batchQueue.value.map {
                     if (it.id == item.id) it.copy(status = BatchStatus.PROCESSING) else it
                 }
@@ -497,13 +532,10 @@ class MasteringViewModel : ViewModel() {
                         SampleAudioGenerator.generateSample(item.sampleTrackType ?: "synthwave")
                     }
 
-                    // Master audio
                     val masteredBuf = AudioMasteringEngine.processOffline(
                         inputBuffer = inputBuf,
                         settings = _settings.value
                     )
-
-                    // Encode WAV
                     val wavData = WavEncoder.encode(
                         buffer = masteredBuf,
                         bitDepth = _settings.value.bitDepth,
@@ -512,10 +544,10 @@ class MasteringViewModel : ViewModel() {
                     )
 
                     val outStream = outputStreamProvider(item)
-                    if (outStream != null) {
-                        outStream.write(wavData)
-                        outStream.flush()
-                        outStream.close()
+                        ?: throw IllegalStateException("Could not create batch output file")
+                    outStream.use { stream ->
+                        stream.write(wavData)
+                        stream.flush()
                     }
 
                     completedCount++
@@ -525,21 +557,24 @@ class MasteringViewModel : ViewModel() {
                 } catch (e: Exception) {
                     errorCount++
                     _batchQueue.value = _batchQueue.value.map {
-                        if (it.id == item.id) it.copy(status = BatchStatus.ERROR, errorMessage = e.message) else it
+                        if (it.id == item.id) {
+                            it.copy(status = BatchStatus.ERROR, errorMessage = e.message)
+                        } else {
+                            it
+                        }
                     }
                 }
             }
 
             _batchProgress.value = 1f
             _isBatchProcessing.value = false
-            _batchStatusText.value = "Done! $completedCount exported" + if (errorCount > 0) ", $errorCount failed" else ""
+            _batchStatusText.value = "Done! $completedCount exported" +
+                if (errorCount > 0) ", $errorCount failed" else ""
             withContext(Dispatchers.Main) {
                 showStatus("Batch complete: $completedCount/$total files mastered successfully.")
             }
         }
     }
-
-    // ─── Single Export ─────────────────────────────────────────────────────────
 
     fun exportActiveTrack(outputStream: OutputStream, onComplete: () -> Unit) {
         val current = _activeBuffer.value ?: return
@@ -553,9 +588,10 @@ class MasteringViewModel : ViewModel() {
                     applyDither = _settings.value.bitDepth == 16,
                     metadata = _metadata.value
                 )
-                outputStream.write(wavBytes)
-                outputStream.flush()
-                outputStream.close()
+                outputStream.use { stream ->
+                    stream.write(wavBytes)
+                    stream.flush()
+                }
 
                 withContext(Dispatchers.Main) {
                     _isLoading.value = false
@@ -572,7 +608,8 @@ class MasteringViewModel : ViewModel() {
     }
 
     override fun onCleared() {
-        super.onCleared()
+        lufsJob?.cancel()
         player.release()
+        super.onCleared()
     }
 }

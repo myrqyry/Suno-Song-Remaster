@@ -10,7 +10,7 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
-import java.util.ArrayList
+import kotlin.math.max
 
 object AudioDecoder {
 
@@ -56,15 +56,26 @@ object AudioDecoder {
                 ?: throw IllegalArgumentException("Audio track has no MIME type")
 
             var decodedSampleRate = inputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-            var decodedChannelCount = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 2)
+            var decodedChannelCount = inputFormat
+                .getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                .coerceIn(1, 2)
             var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
+
+            val durationUs = if (inputFormat.containsKey(MediaFormat.KEY_DURATION)) {
+                inputFormat.getLong(MediaFormat.KEY_DURATION).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+
+            var channelData = Array(decodedChannelCount) {
+                FloatArray(initialFrameCapacity(durationUs, decodedSampleRate))
+            }
+            var totalSamples = 0L
 
             codec = MediaCodec.createDecoderByType(mime)
             codec.configure(inputFormat, null, null, 0)
             codec.start()
 
-            val pcmChunks = ArrayList<FloatArray>()
-            var totalSamples = 0
             val bufferInfo = MediaCodec.BufferInfo()
             var inputEos = false
             var outputEos = false
@@ -107,14 +118,40 @@ object AudioDecoder {
                 when (val outputIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)) {
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val outputFormat = codec.outputFormat
-                        if (outputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
-                            decodedSampleRate = outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        val newSampleRate = if (outputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                            outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        } else {
+                            decodedSampleRate
                         }
-                        if (outputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
-                            decodedChannelCount = outputFormat
-                                .getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                                .coerceIn(1, 2)
+                        val newChannelCount = if (outputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                            outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 2)
+                        } else {
+                            decodedChannelCount
                         }
+
+                        // Android codecs normally report final PCM layout before
+                        // producing data. If the layout changes after PCM has
+                        // already arrived, abort rather than silently corrupting
+                        // channel interleaving.
+                        if (totalSamples > 0L && newChannelCount != decodedChannelCount) {
+                            throw IllegalArgumentException(
+                                "Decoder channel layout changed after PCM output began"
+                            )
+                        }
+
+                        if (totalSamples == 0L &&
+                            (newSampleRate != decodedSampleRate || newChannelCount != decodedChannelCount)
+                        ) {
+                            decodedSampleRate = newSampleRate
+                            decodedChannelCount = newChannelCount
+                            channelData = Array(decodedChannelCount) {
+                                FloatArray(initialFrameCapacity(durationUs, decodedSampleRate))
+                            }
+                        } else {
+                            decodedSampleRate = newSampleRate
+                            decodedChannelCount = newChannelCount
+                        }
+
                         if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
                             val reportedEncoding = outputFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
                             if (reportedEncoding == AudioFormat.ENCODING_PCM_8BIT ||
@@ -133,10 +170,32 @@ object AudioDecoder {
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             outputBuffer.position(bufferInfo.offset)
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            val floatChunk = decodePcmChunk(outputBuffer, pcmEncoding)
-                            if (floatChunk.isNotEmpty()) {
-                                pcmChunks.add(floatChunk)
-                                totalSamples += floatChunk.size
+                            outputBuffer.order(ByteOrder.LITTLE_ENDIAN)
+
+                            val bytesPerSample = bytesPerPcmSample(pcmEncoding)
+                            val sampleCount = outputBuffer.remaining() / bytesPerSample
+                            if (sampleCount > 0) {
+                                val requiredFrames = ((totalSamples + sampleCount + decodedChannelCount - 1L) /
+                                    decodedChannelCount).coerceAtMost(Int.MAX_VALUE.toLong())
+
+                                if (requiredFrames >= Int.MAX_VALUE) {
+                                    throw IllegalArgumentException("Decoded audio is too long")
+                                }
+
+                                channelData = ensureFrameCapacity(
+                                    channelData,
+                                    requiredFrames.toInt()
+                                )
+
+                                repeat(sampleCount) {
+                                    val frameIndex = (totalSamples / decodedChannelCount).toInt()
+                                    val channelIndex = (totalSamples % decodedChannelCount).toInt()
+                                    channelData[channelIndex][frameIndex] = readPcmSample(
+                                        outputBuffer,
+                                        pcmEncoding
+                                    )
+                                    totalSamples++
+                                }
                             }
                         }
 
@@ -149,31 +208,21 @@ object AudioDecoder {
                 }
             }
 
-            val frameCount = totalSamples / decodedChannelCount
+            val frameCount = (totalSamples / decodedChannelCount).toInt()
             if (frameCount <= 0) {
                 throw IllegalArgumentException("Decoder produced no PCM audio")
             }
 
-            val audioBuffer = AudioBuffer(decodedChannelCount, frameCount, decodedSampleRate)
-            var frameIdx = 0
-            var channelIdx = 0
-
-            for (chunk in pcmChunks) {
-                for (sample in chunk) {
-                    if (frameIdx >= frameCount) break
-                    audioBuffer.getChannel(channelIdx)[frameIdx] = sample
-                    channelIdx++
-                    if (channelIdx == decodedChannelCount) {
-                        channelIdx = 0
-                        frameIdx++
-                    }
-                }
-            }
-
-            // Drop references to the temporary decoded chunks before returning
-            // the final planar AudioBuffer so GC can reclaim them immediately.
-            pcmChunks.clear()
-            return audioBuffer
+            // channelData may contain a small amount of unused capacity. Keep it
+            // instead of copying an entire multi-minute song just to trim arrays
+            // to exact length; AudioBuffer.length remains the authoritative frame
+            // count used by processing and playback.
+            return AudioBuffer(
+                channels = decodedChannelCount,
+                length = frameCount,
+                sampleRate = decodedSampleRate,
+                channelData = channelData
+            )
         } finally {
             try {
                 codec?.stop()
@@ -187,6 +236,58 @@ object AudioDecoder {
                 extractor.release()
             } catch (_: Exception) {
             }
+        }
+    }
+
+    private fun initialFrameCapacity(durationUs: Long, sampleRate: Int): Int {
+        val estimatedFrames = if (durationUs > 0L) {
+            (durationUs * sampleRate.toLong()) / 1_000_000L
+        } else {
+            sampleRate.toLong() * 60L
+        }
+        val withSlack = estimatedFrames + sampleRate.toLong()
+        return withSlack
+            .coerceIn(sampleRate.toLong(), (Int.MAX_VALUE - 8).toLong())
+            .toInt()
+    }
+
+    private fun ensureFrameCapacity(
+        current: Array<FloatArray>,
+        requiredFrames: Int
+    ): Array<FloatArray> {
+        if (current.isEmpty() || requiredFrames <= current[0].size) return current
+
+        val currentCapacity = current[0].size
+        val grownCapacity = max(
+            requiredFrames,
+            (currentCapacity.toLong() + currentCapacity / 2L + 1L)
+                .coerceAtMost((Int.MAX_VALUE - 8).toLong())
+                .toInt()
+        )
+        return Array(current.size) { ch -> current[ch].copyOf(grownCapacity) }
+    }
+
+    private fun bytesPerPcmSample(pcmEncoding: Int): Int {
+        return when (pcmEncoding) {
+            AudioFormat.ENCODING_PCM_FLOAT -> 4
+            AudioFormat.ENCODING_PCM_16BIT -> 2
+            AudioFormat.ENCODING_PCM_8BIT -> 1
+            else -> throw IllegalArgumentException(
+                "Unsupported decoded PCM encoding: $pcmEncoding"
+            )
+        }
+    }
+
+    private fun readPcmSample(buffer: ByteBuffer, pcmEncoding: Int): Float {
+        return when (pcmEncoding) {
+            AudioFormat.ENCODING_PCM_FLOAT -> buffer.float
+            AudioFormat.ENCODING_PCM_16BIT -> buffer.short / 32768f
+            AudioFormat.ENCODING_PCM_8BIT ->
+                ((buffer.get().toInt() and 0xFF) - 128) / 128f
+
+            else -> throw IllegalArgumentException(
+                "Unsupported decoded PCM encoding: $pcmEncoding"
+            )
         }
     }
 
@@ -206,33 +307,6 @@ object AudioDecoder {
             } ?: false
         } catch (_: Exception) {
             false
-        }
-    }
-
-    private fun decodePcmChunk(buffer: ByteBuffer, pcmEncoding: Int): FloatArray {
-        buffer.order(ByteOrder.LITTLE_ENDIAN)
-        return when (pcmEncoding) {
-            AudioFormat.ENCODING_PCM_FLOAT -> {
-                val floats = buffer.asFloatBuffer()
-                FloatArray(floats.remaining()).also { floats.get(it) }
-            }
-
-            AudioFormat.ENCODING_PCM_8BIT -> {
-                FloatArray(buffer.remaining()) {
-                    ((buffer.get().toInt() and 0xFF) - 128) / 128f
-                }
-            }
-
-            AudioFormat.ENCODING_PCM_16BIT -> {
-                val shorts = buffer.asShortBuffer()
-                FloatArray(shorts.remaining()) {
-                    shorts.get() / 32768f
-                }
-            }
-
-            else -> throw IllegalArgumentException(
-                "Unsupported decoded PCM encoding: $pcmEncoding"
-            )
         }
     }
 
